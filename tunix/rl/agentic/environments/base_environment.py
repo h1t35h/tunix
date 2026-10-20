@@ -157,7 +157,7 @@ class BaseEnv(abc.ABC):
     Returns:
       tuple[Any, float, bool, dict]: Same return format as step() method.
     """
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, self.step, action)
 
   def close(self):
@@ -169,6 +169,10 @@ class BaseEnv(abc.ABC):
     """
     # Default implementation: nothing to clean up.
     return
+
+  def export_trajectory_extras(self) -> Dict[str, Any]:
+    """Export environment-specific per-trajectory metadata at episode end."""
+    return {}
 
   @classmethod
   def from_dict(cls, env_args: Dict[str, Any]) -> "BaseEnv":

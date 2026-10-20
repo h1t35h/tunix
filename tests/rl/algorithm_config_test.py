@@ -274,6 +274,94 @@ class AlgorithmConfigTest(parameterized.TestCase):
       ):
         algorithm_config.GRPOConfig(routed_experts_num_experts=bad_num)
 
+  def test_mimo_advantage_config_defaults(self):
+    """Verifies MimoAdvantageConfig default values and slots/kw_only."""
+    mimo_cfg = algorithm_config.MimoAdvantageConfig()
+    self.assertEqual(mimo_cfg.lp_pass_rate_threshold, 0.5)
+    self.assertEqual(mimo_cfg.lp_max_penalty, 0.4)
+    self.assertEqual(mimo_cfg.lp_dead_zone, 0.2)
+    self.assertEqual(mimo_cfg.lp_saturation, 1.0)
+    self.assertEqual(mimo_cfg.lp_gamma, 1.0)
+    self.assertEqual(mimo_cfg.gar_lambda_max, 2.0)
+    self.assertEqual(mimo_cfg.gar_rank_rho, 0.5)
+    self.assertEqual(mimo_cfg.span_kappa, 1.5)
+    self.assertEqual(mimo_cfg.span_alpha_max, 2.0)
+    self.assertEqual(mimo_cfg.span_beta_min, 0.5)
+    self.assertEqual(mimo_cfg.span_beta_pos, 0.5)
+    self.assertTrue(mimo_cfg.span_renormalize)
+    self.assertTrue(mimo_cfg.std_normalize)
+    with self.assertRaises(AttributeError):
+      mimo_cfg.unknown_field = 123
+
+  def test_gspo_turn_and_gspo_pool_mode_validation(self):
+    """Verifies gspo-turn and gspo_pool_mode validation in GRPOConfig."""
+    cfg_turn = algorithm_config.GRPOConfig(
+        algo_variant="gspo-turn",
+        loss_algo="gspo-turn",
+    )
+    self.assertEqual(cfg_turn.algo_variant, "gspo-turn")
+    self.assertEqual(cfg_turn.loss_algo, "gspo-turn")
+    self.assertEqual(cfg_turn.gspo_pool_mode, "turn")
+
+    cfg_pool = algorithm_config.GRPOConfig(
+        loss_algo="gspo-token",
+        gspo_pool_mode="turn",
+    )
+    self.assertEqual(cfg_pool.gspo_pool_mode, "turn")
+
+    with self.assertRaisesRegex(
+        ValueError, "gspo_pool_mode must be 'sequence' or 'turn'"
+    ):
+      algorithm_config.GRPOConfig(gspo_pool_mode="invalid")
+
+  def test_clip_mode_and_token_advantage_mode_validation(self):
+    """Verifies clip_mode, epsilon_neg, and token_advantage_mode validation."""
+    cfg = algorithm_config.GRPOConfig(epsilon=0.2, epsilon_high=0.28)
+    self.assertEqual(cfg.clip_mode, "ppo")
+    self.assertEqual(cfg.epsilon_neg, 0.2)
+    self.assertEqual(cfg.epsilon_neg_high, 0.28)
+    self.assertEqual(cfg.token_advantage_mode, "none")
+    self.assertIsNone(cfg.mimo)
+
+    cfg_mimo = algorithm_config.GRPOConfig(
+        advantage_estimator="mimo",
+        token_advantage_mode="mimo",
+        clip_mode="mask",
+        loss_algo="grpo",
+        epsilon=0.05,
+        epsilon_high=0.06,
+        epsilon_neg=0.06,
+        epsilon_neg_high=0.05,
+        mimo=algorithm_config.MimoAdvantageConfig(gar_lambda_max=1.8),
+    )
+    self.assertEqual(cfg_mimo.advantage_estimator, "mimo")
+    self.assertEqual(cfg_mimo.token_advantage_mode, "mimo")
+    self.assertEqual(cfg_mimo.clip_mode, "mask")
+    self.assertEqual(cfg_mimo.epsilon_neg, 0.06)
+    self.assertEqual(cfg_mimo.epsilon_neg_high, 0.05)
+    self.assertIsNotNone(cfg_mimo.mimo)
+    self.assertEqual(cfg_mimo.mimo.gar_lambda_max, 1.8)
+
+    with self.assertRaisesRegex(ValueError, "clip_mode must be 'ppo' or 'mask'"):
+      algorithm_config.GRPOConfig(clip_mode="invalid")
+
+    with self.assertRaisesRegex(
+        ValueError, "clip_mode='mask' is only supported when loss_algo='grpo'"
+    ):
+      algorithm_config.GRPOConfig(clip_mode="mask", loss_algo="gspo-token")
+
+    with self.assertRaisesRegex(
+        ValueError, "token_advantage_mode must be 'none', 'mask', or 'mimo'"
+    ):
+      algorithm_config.GRPOConfig(token_advantage_mode="bad")
+
+    with self.assertRaisesRegex(
+        ValueError, "token_advantage_mode='mimo' requires advantage_estimator='mimo'"
+    ):
+      algorithm_config.GRPOConfig(
+          advantage_estimator="grpo", token_advantage_mode="mimo"
+      )
+
 
 if __name__ == "__main__":
   absltest.main()

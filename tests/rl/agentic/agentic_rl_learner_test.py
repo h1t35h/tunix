@@ -411,6 +411,49 @@ class ExactTokenContinuityConfigTest(absltest.TestCase):
     self.assertEqual(sent["prompts"], [[{"role": "user", "content": "q"}]])
     self.assertEqual([type(m["content"]) for m in sent["prompts"][0]], [str])
 
+  def test_wrap_group_stream_with_postprocessor(self):
+    import asyncio  # pylint: disable=g-import-not-at-top
+    import types  # pylint: disable=g-import-not-at-top
+    from tunix.rl.agentic.agents import agent_types  # pylint: disable=g-import-not-at-top
+
+    class _TagProcessor:
+
+      async def process_group(self, group):
+        for item in group:
+          item.traj["tagged"] = True
+        return group
+
+    async def _raw_stream():
+      yield [agent_types.TrajectoryItem(traj={"id": 1})]
+      yield [agent_types.TrajectoryItem(traj={"id": 2})]
+
+    obj = types.SimpleNamespace(
+        group_postprocessor=_TagProcessor(),
+        group_max_in_flight=4,
+        group_stage_timeout_s=30.0,
+        _group_max_in_flight=4,
+        _group_stage_timeout_s=30.0,
+    )
+    with mock.patch.object(
+        agentic_rl_learner.group_postprocess,
+        "BoundedGroupStage",
+        wraps=agentic_rl_learner.group_postprocess.BoundedGroupStage,
+    ) as spy_stage:
+      wrapped = agentic_rl_learner.AgenticRLLearner._wrap_group_stream(
+          obj, _raw_stream()
+      )
+      spy_stage.assert_called_once_with(
+          obj.group_postprocessor, max_in_flight=4, timeout_s=30.0
+      )
+
+    async def _collect():
+      return [g async for g in wrapped]
+
+    groups = asyncio.run(_collect())
+    self.assertLen(groups, 2)
+    self.assertTrue(groups[0][0].traj["tagged"])
+    self.assertTrue(groups[1][0].traj["tagged"])
+
 
 if __name__ == "__main__":
   absltest.main()

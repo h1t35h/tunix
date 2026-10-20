@@ -133,6 +133,11 @@ class TrainExample:
   sampler_agreement_applied: bool = flax.struct.field(
       default=False, pytree_node=False
   )
+  token_mask: ArrayType | None = None
+  turn_ids: ArrayType | None = None
+  num_turn_segments: int | None = flax.struct.field(
+      default=None, pytree_node=False
+  )
 
   def to_jax_array(self) -> "TrainExample":
     """Returns a copy of the batch with all array fields moved to JAX array."""
@@ -630,9 +635,9 @@ def compute_per_token_logps(
       return per_token_logps, per_token_entropy  # pyrefly: ignore[unbound-name]
     return per_token_logps
   else:
-    logits = outputs[:, -logits_to_keep - 1 : -1, :]
+    logits = outputs[:, -logits_to_keep - 1 : -1, :].astype(jnp.float32)
     if temperature != 0.0 and temperature != 1.0:
-      logits /= temperature
+      logits = logits / jnp.asarray(temperature, dtype=jnp.float32)
 
     per_token_logps = selective_log_softmax(logits, input_tokens_to_keep)
 

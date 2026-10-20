@@ -48,6 +48,7 @@ from tunix.rl.agentic.agents import model_agent
 from tunix.rl.agentic.environments import base_environment
 from tunix.rl.agentic.environments import task_environment
 from tunix.utils import compat
+from tunix.rl.agentic.pipeline import group_postprocess
 from tunix.rl.agentic.pipeline import rollout_orchestrator
 from tunix.rl.agentic.rewards import reward  # pylint: disable=unused-import
 from tunix.rl.agentic.trajectory import trajectory_collect_engine
@@ -105,6 +106,12 @@ TConfig = TypeVar("TConfig", bound=AgenticRLConfig)
 class AgenticRLLearner(abc.ABC, Generic[TConfig]):
   """Base class for Agentic RL Learners using asynchronous rollouts."""
 
+  group_postprocessor: group_postprocess.GroupPostProcessor | None = None
+  group_max_in_flight: int = 8
+  group_stage_timeout_s: float = 90.0
+  _group_max_in_flight: int = 8
+  _group_stage_timeout_s: float = 90.0
+
   class _AsyncQueueIterator:
     """Async iterator that yields items from a sync queue."""
 
@@ -141,6 +148,9 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
           base_environment.BaseTaskEnv
       ] = task_environment.TaskEnvironment,
       env_kwargs: Dict[str, Any] | None = None,
+      group_postprocessor: group_postprocess.GroupPostProcessor | None = None,
+      group_max_in_flight: int = 8,
+      group_stage_timeout_s: float = 90.0,
   ):
     """Initializes the `AgenticRLLearner`.
 
@@ -161,6 +171,11 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       agent_kwargs: Keyword arguments for the agent class.
       env_class: User defined environment class.
       env_kwargs: Keyword arguments for the environment class.
+      group_postprocessor: Optional async post-processor over trajectory groups.
+      group_max_in_flight: Maximum concurrent trajectory groups in
+        `BoundedGroupStage`.
+      group_stage_timeout_s: Per-group timeout in seconds for
+        `BoundedGroupStage`.
     """
     self.rl_engine = rl_engine
     self.algo_config = algo_config
@@ -185,6 +200,11 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     self.agent_kwargs = agent_kwargs or {}
     self.env_class = env_class
     self.env_kwargs = env_kwargs or {}
+    self.group_postprocessor = group_postprocessor
+    self.group_max_in_flight = group_max_in_flight
+    self.group_stage_timeout_s = group_stage_timeout_s
+    self._group_max_in_flight = group_max_in_flight
+    self._group_stage_timeout_s = group_stage_timeout_s
 
     self.rl_engine.global_steps = (
         self.rl_engine.actor_trainer.restored_global_step()
@@ -676,6 +696,20 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     """Returns the number of generations per prompt."""
     return self.algo_config.num_generations
 
+  def _wrap_group_stream(
+      self,
+      group_stream: AsyncIterator[list[Any]],
+  ) -> AsyncIterator[list[Any]]:
+    """Wraps a group stream with `BoundedGroupStage` when configured."""
+    if self.group_postprocessor is None:
+      return group_stream
+    stage = group_postprocess.BoundedGroupStage(
+        self.group_postprocessor,
+        max_in_flight=self._group_max_in_flight,
+        timeout_s=self._group_stage_timeout_s,
+    )
+    return stage.wrap(group_stream)
+
   async def _producer(
       self,
       orchestrator,
@@ -692,13 +726,16 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
           yield prompt
 
     prompt_iterator = _iterate_micro_batches()
+    group_stream = self._wrap_group_stream(
+        self._orchestrator_producer(
+            orchestrator=orchestrator,
+            prompt_iterator=prompt_iterator,
+            num_generations=self.algo_config.num_generations,
+            collect_mode="Token",
+        )
+    )
     try:
-      async for batch in self._orchestrator_producer(
-          orchestrator=orchestrator,
-          prompt_iterator=prompt_iterator,
-          num_generations=self.algo_config.num_generations,
-          collect_mode="Token",
-      ):
+      async for batch in group_stream:
         try:
           if self._process_in_consumer:
             # Put raw batch (list of trajectories) into queue.
@@ -734,6 +771,40 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       if not batch:
         return  # The iterator is exhausted.
       yield batch
+
+  @staticmethod
+  def _normalize_micro_batch_metadata(
+      train_micro_batch: Sequence[TrainExample],
+  ) -> List[TrainExample]:
+    """Normalizes static PyTree metadata (`num_turn_segments`, `num_segments`) across a micro-batch."""
+    items = list(train_micro_batch)
+    if len(items) <= 1:
+      return items
+    max_turn_segs = max(
+        (getattr(ex, "num_turn_segments", None) or 0 for ex in items),
+        default=0,
+    )
+    if max_turn_segs > 0:
+      items = [
+          dataclasses.replace(ex, num_turn_segments=max_turn_segs)
+          if dataclasses.is_dataclass(ex)
+          and getattr(ex, "num_turn_segments", None) != max_turn_segs
+          else ex
+          for ex in items
+      ]
+    max_segs = max(
+        (getattr(ex, "num_segments", None) or 0 for ex in items),
+        default=0,
+    )
+    if max_segs > 0:
+      items = [
+          dataclasses.replace(ex, num_segments=max_segs)
+          if dataclasses.is_dataclass(ex)
+          and getattr(ex, "num_segments", None) != max_segs
+          else ex
+          for ex in items
+      ]
+    return items
 
   def train(
       self,
@@ -791,9 +862,14 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     # pack-first: with packing on, the pack is the logp batch, so logp is
     # computed on the packed buffer after pack_sequences; do not defer
     # conversion to the consumer (which would enqueue raw lists pack_sequences
-    # cannot consume).
-    if self._compute_logps_micro_batch_size > 1 and not self._packing_enabled:
-      if self._compute_logps_micro_batch_size != train_micro_batch_size:
+    # cannot consume). When not packing, always compute old/ref logps on the
+    # consumer thread before actor updates so producer rollouts never race
+    # against concurrent actor weight updates.
+    if not self._packing_enabled:
+      if (
+          self._compute_logps_micro_batch_size > 1
+          and self._compute_logps_micro_batch_size != train_micro_batch_size
+      ):
         raise ValueError(
             "compute_logps_micro_batch_size"
             f" ({self._compute_logps_micro_batch_size}) must be equal to"
@@ -856,17 +932,34 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
         train_data_queue, iterator_batch_size
     )
     if self._process_in_consumer:
-      # Convert raw Trajectory groups into TrainExamples up front, before
-      # `pack_sequences` wraps the generator below. Otherwise `pack_sequences`
-      # (via `unpad_train_example`) receives raw lists and crashes on
-      # `.prompt_ids`.
+      # Convert raw Trajectory groups into TrainExamples on the consumer
+      # thread so old_per_token_logps are always computed deterministically
+      # against the pre-update actor weights.
       def _to_train_examples(raw_gen):
-        for group_batch in raw_gen:
-          all_trajectories = [t for group in group_batch for t in group]
-          yield self._batch_to_train_example(
-              batch_results=all_trajectories,
-              mode=rl_engine_lib.Mode.TRAIN,
-          )
+        try:
+          for group_batch in raw_gen:
+            if self._compute_logps_micro_batch_size > 1:
+              all_trajectories = [t for group in group_batch for t in group]
+              yield self._batch_to_train_example(
+                  batch_results=all_trajectories,
+                  mode=rl_engine_lib.Mode.TRAIN,
+              )
+            else:
+              train_examples = []
+              for group in group_batch:
+                if not group:
+                  continue
+                train_examples.extend(
+                    self._batch_to_train_example(
+                        batch_results=group,
+                        mode=rl_engine_lib.Mode.TRAIN,
+                    )
+                )
+              if train_examples:
+                yield train_examples
+        except Exception:
+          prompt_queue.put(None)
+          raise
 
       train_data_gen = _to_train_examples(train_data_gen)
     if self._packing_enabled:
@@ -895,55 +988,19 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
               self._training_config, "max_segments_per_packed_row", None
           ),
       )
-    update_steps_since_last_sync = 0
-    update_steps_per_full_batch = full_batch_size // mini_batch_size
-    unpacked_micro_step_counter = 0
-    did_eval_this_global_step = False
-    full_batch_chunks = []
-    for train_micro_batch in train_data_gen:
-      if (
-          self._training_config.max_steps
-          and self.rl_engine.global_steps >= self._training_config.max_steps
-      ):
-        logging.info(
-            "Reached max_steps: %d >= %d",
-            self.rl_engine.global_steps,
-            self._training_config.max_steps,
-        )
-        prompt_queue.put(None)
-        break
-      self._iter_steps += 1
 
-      # TODO(tsbao): Re-enable this once off-policy filtering is needed.
-      # Filter out examples that are too old (off-policy).
-      # filtered_train_micro_batch = self._filter_outdated_offpolicy_examples(
-      #     train_micro_batch
-      # )
-      # if not filtered_train_micro_batch:
-      #   continue
-      # train_micro_batch = filtered_train_micro_batch
-
-      # `train_micro_batch` is always a Sequence[TrainExample] now:
-      #  - _process_in_consumer: converted up front (GRPO -> single-element list)
-      #  - producer-side processing: TrainExamples straight from the queue
-      #  - _packing_enabled: a single packed TrainExample from pack_sequences
-      # jax.tree.map(concatenate) over a single-element list is a no-op, so this
-      # equals the old `train_examples[0]` for the GRPO consumer path.
-      merged_train_micro_batch = jax.tree.map(
-          lambda *xs: jnp.concatenate(xs, axis=0), *train_micro_batch
+    def _prepare_one_micro_batch(
+        raw_micro_batch: Sequence[TrainExample],
+    ) -> tuple[TrainExample, list[TrainExample], bool]:
+      normalized_micro_batch = self._normalize_micro_batch_metadata(
+          raw_micro_batch
       )
-
+      merged_mb = jax.tree.map(
+          lambda *xs: jnp.concatenate(xs, axis=0), *normalized_micro_batch
+      )
       if self._packing_enabled:
-        # pack-first: old/ref logp were deferred (left None) so they can be
-        # computed here on the packed buffer (segment-aware forward), sharing
-        # the same packed representation training uses.
-        merged_train_micro_batch = self._compute_packed_logps(
-            merged_train_micro_batch
-        )
-        # Packing efficiency: segment_ids==0 marks padding and dummy packs, so
-        # this is the wasted fraction. As a WeightedMetric it reduces by
-        # Sum(pad)/Sum(total), which stays correct if pack shapes ever differ.
-        seg = np.asarray(merged_train_micro_batch.segment_ids)
+        merged_mb = self._compute_packed_logps(merged_mb)
+        seg = np.asarray(merged_mb.segment_ids)
         dummy_ratio = sft_utils.WeightedMetric(
             jnp.array(float((seg == 0).sum())), jnp.array(float(seg.size))
         )
@@ -961,27 +1018,18 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
             mode=rl_engine_lib.Mode.TRAIN,
             step=self.rl_engine.global_steps,
         )
-
-      # When ``train_micro_batch_size < mini_batch_size`` we want the trainer
-      # to invoke ``train_step`` multiple times per outer iteration so the
-      # optimizer (which fires every ``gradient_accumulation_steps`` micro-
-      # steps) sees ``mini_batch_size``-shaped gradients while peak HBM is
-      # only ``train_micro_batch_size``-shaped. Slice the merged train
-      # example along its batch axis into chunks sized to one micro-step,
-      # and pass the list to ``update_actor``; ``peft_trainer.train``
-      # iterates the list and calls ``train_step`` once per chunk.
-      is_packed = (
-          hasattr(merged_train_micro_batch, "segment_ids")
-          and getattr(merged_train_micro_batch, "segment_ids") is not None
+      mb_is_packed = (
+          hasattr(merged_mb, "segment_ids")
+          and getattr(merged_mb, "segment_ids") is not None
       )
-      if not is_packed:
+      if not mb_is_packed:
         assert train_micro_batch_size is not None
         seqs_per_chunk = (
             train_micro_batch_size * self.algo_config.num_generations
         )
-        n_total = merged_train_micro_batch.completion_ids.shape[0]
+        n_total = merged_mb.completion_ids.shape[0]
         if n_total > seqs_per_chunk:
-          chunked_train_micro_batch = [
+          chunked_mb = [
               jax.tree_util.tree_map(
                   lambda x: (
                       x[i : i + seqs_per_chunk]
@@ -990,66 +1038,52 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
                       and x.shape[0] == n_total
                       else x
                   ),
-                  merged_train_micro_batch,
+                  merged_mb,
               )
               for i in range(0, n_total, seqs_per_chunk)
           ]
         else:
-          chunked_train_micro_batch = [merged_train_micro_batch]
+          chunked_mb = [merged_mb]
       else:
-        chunked_train_micro_batch = [merged_train_micro_batch]
+        chunked_mb = [merged_mb]
+      return merged_mb, chunked_mb, mb_is_packed
 
+    update_steps_since_last_sync = 0
+    update_steps_per_full_batch = full_batch_size // mini_batch_size
+    unpacked_micro_step_counter = 0
+    did_eval_this_global_step = False
+    full_batch_chunks = []
+    pending_micro_batches = []
+    for train_micro_batch in train_data_gen:
+      if (
+          not pending_micro_batches
+          and self._training_config.max_steps
+          and self.rl_engine.global_steps >= self._training_config.max_steps
+      ):
+        logging.info(
+            "Reached max_steps: %d >= %d",
+            self.rl_engine.global_steps,
+            self._training_config.max_steps,
+        )
+        prompt_queue.put(None)
+        break
+
+      # TODO(tsbao): Re-enable this once off-policy filtering is needed.
+      # Filter out examples that are too old (off-policy).
+      # filtered_train_micro_batch = self._filter_outdated_offpolicy_examples(
+      #     train_micro_batch
+      # )
+      # if not filtered_train_micro_batch:
+      #   continue
+      # train_micro_batch = filtered_train_micro_batch
+
+      merged_train_micro_batch, chunked_train_micro_batch, is_packed = (
+          _prepare_one_micro_batch(train_micro_batch)
+      )
+      pending_micro_batches.append(chunked_train_micro_batch)
       full_batch_chunks.extend(chunked_train_micro_batch)
 
-      # --- Evaluation Logic on FIRST microbatch ---
-      current_eval_dataset = None
-      if update_steps_since_last_sync == 0:
-        current_train_step = self.rl_engine.actor_trainer.train_steps
-        if (
-            all_eval_prompts
-            and current_train_step % training_config.eval_every_n_steps == 0
-            and current_train_step != self._last_eval_train_step
-        ):
-          self._last_eval_train_step = current_train_step
-          self._eval_iter_steps = 0
-          eval_orchestrator = self._build_orchestrator()
-
-          async def _eval_runner_async(current_eval_orchestrator):
-            eval_examples = []
-            async for batch in self._orchestrator_producer(
-                current_eval_orchestrator,
-                all_eval_prompts,
-                num_generations=self._num_generations(),
-            ):
-              eval_example = self._batch_to_train_example(
-                  batch,
-                  rl_engine_lib.Mode.EVAL,
-              )
-              eval_examples.extend(eval_example)
-            return eval_examples
-
-          eval_future = asyncio.run_coroutine_threadsafe(
-              _eval_runner_async(eval_orchestrator), self.loop
-          )
-          eval_examples = eval_future.result()
-          self._eval_iter_steps += 1
-          current_eval_dataset = eval_examples
-          did_eval_this_global_step = True
-
-      # --- First iteration Training Step (Parallelized with Rollout) ---
-      # Note: Suppose one full batch has m minibatches, each minibatch has n
-      # microbatches, and #iterations=K, we will:
-      #   1. Train on the m * n microbatches once as we get them from rollout.
-      #   2. When we get the full batch, repeat K-1 times on the entire batch.
-      self.rl_engine.update_actor(
-          chunked_train_micro_batch, current_eval_dataset, skip_jit
-      )
-      if hasattr(self.rl_engine, "critic_trainer"):
-        self.rl_engine.update_critic(
-            chunked_train_micro_batch, current_eval_dataset, skip_jit
-        )
-
-      # --- Weight Sync Logic ---
+      # --- Weight Sync / Full-Batch Boundary Tracking ---
       if is_packed:
         # `merged_train_micro_batch.is_update_step` is a 0-d jax scalar set
         # by `pack_sequences`; pull the host-side value before deciding.
@@ -1065,6 +1099,63 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
 
       if is_update:
         update_steps_since_last_sync += 1
+
+      if update_steps_since_last_sync < update_steps_per_full_batch:
+        # Materialize all micro-batches of the current full rollout batch
+        # (including their old_per_token_logps under the pre-update actor
+        # weights) before executing any optimizer step on the actor.
+        continue
+
+      # --- First iteration Training Step (All old_logps materialized) ---
+      for mb_idx, mb_chunks in enumerate(pending_micro_batches):
+        self._iter_steps += 1
+
+        # --- Evaluation Logic on FIRST microbatch ---
+        current_eval_dataset = None
+        if mb_idx == 0:
+          current_train_step = self.rl_engine.actor_trainer.train_steps
+          if (
+              all_eval_prompts
+              and current_train_step % training_config.eval_every_n_steps == 0
+              and current_train_step != self._last_eval_train_step
+          ):
+            self._last_eval_train_step = current_train_step
+            self._eval_iter_steps = 0
+            eval_orchestrator = self._build_orchestrator()
+
+            async def _eval_runner_async(current_eval_orchestrator):
+              eval_examples = []
+              eval_stream = self._wrap_group_stream(
+                  self._orchestrator_producer(
+                      current_eval_orchestrator,
+                      all_eval_prompts,
+                      num_generations=self._num_generations(),
+                  )
+              )
+              async for batch in eval_stream:
+                eval_example = self._batch_to_train_example(
+                    batch,
+                    rl_engine_lib.Mode.EVAL,
+                )
+                eval_examples.extend(eval_example)
+              return eval_examples
+
+            eval_future = asyncio.run_coroutine_threadsafe(
+                _eval_runner_async(eval_orchestrator), self.loop
+            )
+            eval_examples = eval_future.result()
+            self._eval_iter_steps += 1
+            current_eval_dataset = eval_examples
+            did_eval_this_global_step = True
+
+        self.rl_engine.update_actor(
+            mb_chunks, current_eval_dataset, skip_jit
+        )
+        if hasattr(self.rl_engine, "critic_trainer"):
+          self.rl_engine.update_critic(
+              mb_chunks, current_eval_dataset, skip_jit
+          )
+      pending_micro_batches.clear()
 
       if update_steps_since_last_sync == update_steps_per_full_batch:
         # --- Remaining Iterations Training Step ---

@@ -621,13 +621,22 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
     pool = self._get_postprocess_pool()
     self._postprocessed = None
     pending: Dict[str, concurrent.futures.Future[Any]] = {}
+    inline_done: Dict[str, Any] = {}
     for future in concurrent.futures.as_completed(futures):
       result = future.result()
       if isinstance(result, RequestOutput):
-        pending[result.request_id] = pool.submit(
-            self._postprocess_request_output, result
-        )
-    self._postprocessed = {rid: f.result() for rid, f in pending.items()}
+        try:
+          pending[result.request_id] = pool.submit(
+              self._postprocess_request_output, result
+          )
+        except RuntimeError:
+          inline_done[result.request_id] = self._postprocess_request_output(
+              result
+          )
+    self._postprocessed = {
+        **inline_done,
+        **{rid: f.result() for rid, f in pending.items()},
+    }
 
   def _generate_offline(
       self,

@@ -30,6 +30,7 @@ The data flow is designed around an asynchronous producer-consumer pattern:
 from __future__ import annotations
 
 import dataclasses
+import inspect
 from typing import Any, Dict, List, Sequence, Type, TypeVar
 
 from absl import logging
@@ -39,6 +40,7 @@ import jax.numpy as jnp
 import numpy as np
 from tunix.generate import utils as generate_utils
 from tunix.perf.experimental import constants as perf_constants
+from tunix.rl import advantage_shaping
 from tunix.rl import algo_core  # pylint: disable=unused-import
 from tunix.rl import common
 from tunix.rl import function_registry
@@ -50,6 +52,7 @@ from tunix.rl.agentic.agents import base_agent
 from tunix.rl.agentic.agents import model_agent
 from tunix.rl.agentic.environments import base_environment
 from tunix.rl.agentic.environments import task_environment
+from tunix.rl.agentic.pipeline import group_postprocess
 from tunix.utils import compat
 from tunix.utils import trajectory_logger
 
@@ -116,7 +119,7 @@ class GRPOConfig(agentic_rl_learner.AgenticRLConfig):
       False  # Whether to mask out degenerate groups with all-0 advantages.
   )
 
-  def __post_init__(self):
+  def __post_init__(self) -> None:
     if self.num_generations <= 1:
       raise ValueError(
           "num_generations must be greater than 1. Received: "
@@ -124,12 +127,19 @@ class GRPOConfig(agentic_rl_learner.AgenticRLConfig):
       )
     if self.epsilon_high is None:
       self.epsilon_high = self.epsilon
-    if self.loss_algo not in ["grpo", "gspo-token"]:
+    if self.epsilon_neg is None:
+      self.epsilon_neg = self.epsilon
+    if self.epsilon_neg_high is None:
+      self.epsilon_neg_high = self.epsilon_high
+    if self.loss_algo == "gspo-turn":
+      self.gspo_pool_mode = "turn"
+    if self.loss_algo not in ["grpo", "gspo-token", "gspo-turn"]:
       raise ValueError(
-          "loss_algo should be either grpo or gspo-token. Received: "
-          f"{self.loss_algo}"
+          "loss_algo should be either grpo or gspo-token (or gspo-turn)."
+          f" Received: {self.loss_algo}"
       )
     self._validate_sampler_is_and_rs_options()
+    self._validate_clip_and_token_advantage_options(loss_algo=self.loss_algo)
 
 
 TGrpoConfig = TypeVar("TGrpoConfig", bound=GRPOConfig)
@@ -166,7 +176,10 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
           base_environment.BaseTaskEnv
       ] = task_environment.TaskEnvironment,
       env_kwargs: Dict[str, Any] | None = None,
-  ):
+      group_postprocessor: group_postprocess.GroupPostProcessor | None = None,
+      group_max_in_flight: int = 8,
+      group_stage_timeout_s: float = 90.0,
+  ) -> None:
     """Initializes the `GRPOTrainer`.
 
     Args:
@@ -190,6 +203,11 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
       agent_kwargs: Keyword arguments to pass to the agent class.
       env_class: The class of the environment to be used.
       env_kwargs: Keyword arguments to pass to the environment class.
+      group_postprocessor: Optional group post-processor for trajectory groups.
+      group_max_in_flight: Maximum concurrent trajectory groups in
+        `BoundedGroupStage`.
+      group_stage_timeout_s: Per-group timeout in seconds for
+        `BoundedGroupStage`.
     """  # fmt: skip
     super().__init__(
         rl_engine=rl_engine,
@@ -201,6 +219,9 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
         agent_kwargs=agent_kwargs,
         env_class=env_class,
         env_kwargs=env_kwargs,
+        group_postprocessor=group_postprocessor,
+        group_max_in_flight=group_max_in_flight,
+        group_stage_timeout_s=group_stage_timeout_s,
     )
 
     self._trajectory_logger = None
@@ -253,12 +274,16 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
         "reduced_pg_loss": common.mean_of_means,  # pyrefly: ignore[bad-assignment]
         "unreduced_pg_loss": common.global_weighted_mean,  # pyrefly: ignore[bad-assignment]
         "pg_clipfrac": common.mean_of_means,  # pyrefly: ignore[bad-assignment]
+        "seq_clipfrac": common.mean_of_means,  # pyrefly: ignore[bad-assignment]
         "ppo_kl": common.mean_of_means,  # pyrefly: ignore[bad-assignment]
         "kl_loss": common.mean_of_means,  # pyrefly: ignore[bad-assignment]
         "is_ratio/mean": common.mean_of_means,  # pyrefly: ignore[bad-assignment]
         "is_ratio/max": np.max,
         "is_ratio/min": np.min,
+        "log_ratio/mean": common.mean_of_means,  # pyrefly: ignore[bad-assignment]
+        "log_ratio_mean": common.mean_of_means,  # pyrefly: ignore[bad-assignment]
         "log_ratio/abs_mean": common.mean_of_means,  # pyrefly: ignore[bad-assignment]
+        "log_ratio_abs_mean": common.mean_of_means,  # pyrefly: ignore[bad-assignment]
         "pg_loss/unclipped_mean": common.mean_of_means,  # pyrefly: ignore[bad-assignment]
         "pg_loss/clipped_mean": common.mean_of_means,  # pyrefly: ignore[bad-assignment]
         "advantage/abs_mean": common.mean_of_means,  # pyrefly: ignore[bad-assignment]
@@ -310,11 +335,11 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
 
   def _sampler_trainer_agreement(
       self,
-      rollout_per_token_logps,
-      trainer_per_token_logps,
-      completion_mask,
-      segment_ids=None,
-  ):
+      rollout_per_token_logps: jax.Array | None,
+      trainer_per_token_logps: jax.Array | None,
+      completion_mask: jax.Array,
+      segment_ids: jax.Array | None = None,
+  ) -> tuple[dict[str, Any], jax.Array | None, jax.Array]:
     """Sampler-vs-trainer agreement metrics and the IS/RS weights built from them.
 
     Thin wrapper around ``common.sampler_trainer_agreement`` that supplies the
@@ -340,8 +365,11 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
     # compute them here on the packed buffer via the segment-aware forward.
     pad_value = self.rl_engine.rollout.pad_id()
     eos_value = self.rl_engine.rollout.eos_id()
+    training_cfg = self.rl_engine.cluster_config.training_config
     micro = (
-        self.rl_engine.cluster_config.training_config.compute_logps_micro_batch_size
+        getattr(training_cfg, "compute_logps_micro_batch_size", None)
+        or getattr(training_cfg, "train_micro_batch_size", None)
+        or getattr(training_cfg, "mini_batch_size", None)
     )
 
     prompt_tokens = jnp.asarray(example.prompt_ids)
@@ -486,6 +514,8 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
     prompt_lengths_list: List[int | None] = []
     completion_tokens_list: List[np.ndarray] = []
     completion_masks_list: List[np.ndarray] = []
+    token_flags_list: List[np.ndarray] = []
+    turn_spans_list: List[Any] = []
     old_logprobs_list: List[np.ndarray | None] = []
     policy_versions_list: List[int] = []
     trajectory_rewards_list: List[float] = []
@@ -495,24 +525,30 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
     for item in trajectories:
       trajectories_to_log.append(item.traj)
       conversation = item.traj.get("conversation_text") or []
-      assistant_text = next(
-          (
-              message["content"]
-              for message in conversation
-              if message["role"] == "assistant"
-          ),
-          "",
-      )
+      if isinstance(conversation, list):
+        assistant_turns = [
+            str(message["content"])
+            for message in conversation
+            if isinstance(message, dict) and message.get("role") == "assistant"
+        ]
+        assistant_text = "\n".join(assistant_turns)
+      else:
+        assistant_text = str(conversation)
 
       completion_texts.append(assistant_text)
       prompt_tokens_list.append(np.asarray(item.traj.get("prompt_tokens")))
       prompt_lengths_list.append(item.traj.get("prompt_length"))
-      completion_tokens_list.append(
-          np.asarray(item.traj.get("conversation_tokens"))
-      )
+      comp_tokens = np.asarray(item.traj.get("conversation_tokens"))
+      completion_tokens_list.append(comp_tokens)
       completion_masks_list.append(
           np.asarray(item.traj.get("conversation_masks"))
       )
+      raw_flags = item.traj.get("conversation_token_flags")
+      if raw_flags is not None:
+        token_flags_list.append(np.asarray(raw_flags, dtype=np.int8))
+      else:
+        token_flags_list.append(np.zeros(len(comp_tokens), dtype=np.int8))
+      turn_spans_list.append(item.traj.get("assistant_turn_token_spans"))
       old_logprobs = item.traj.get("old_logprobs")
       old_logprobs_list.append(
           np.asarray(old_logprobs) if old_logprobs is not None else None
@@ -536,9 +572,12 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
     padded_prompt_ids = []
     padded_completion_ids = []
     padded_completion_masks = []
+    padded_token_flags = []
+    padded_turn_ids = []
     padded_old_logprobs = []
     padded_prompt_masks = []
     padded_completion_attention_masks = []
+    has_any_old_logprobs = any(lp is not None for lp in old_logprobs_list)
 
     max_response_length = self.algo_config.max_response_length
     clipped_completion_count = 0
@@ -547,12 +586,16 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
         prompt_len_raw,
         completion_tokens,
         completion_mask,
+        token_flags,
+        turn_spans,
         old_logprobs,
     ) in zip(
         prompt_tokens_list,
         prompt_lengths_list,
         completion_tokens_list,
         completion_masks_list,
+        token_flags_list,
+        turn_spans_list,
         old_logprobs_list,
     ):
       prompt_len = (
@@ -595,12 +638,46 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
       )
       padded_prompt_ids.append(padded_prompt)
       padded_completion_ids.append(padded_completion[:max_response_length])
-      padded_completion_masks.append(
-          agentic_utils.right_pad(completion_mask, max_response_length, 0)[
-              :max_response_length
-          ]
+      padded_mask = agentic_utils.right_pad(
+          completion_mask, max_response_length, 0
+      )[:max_response_length]
+      padded_completion_masks.append(padded_mask)
+      padded_flags = agentic_utils.right_pad(
+          token_flags, max_response_length, 0, dtype=np.int8
+      )[:max_response_length]
+      padded_token_flags.append(
+          np.where(padded_mask != 0, padded_flags, 0).astype(np.int8)
       )
-      if self.algo_config.use_rollout_logps:
+
+      turn_ids_row = np.zeros(max_response_length, dtype=np.int32)
+      valid_spans: list[tuple[int, int]] = []
+      if isinstance(turn_spans, (list, tuple)):
+        for span in turn_spans:
+          if isinstance(span, (list, tuple)) and len(span) >= 2:
+            s_idx = max(0, int(span[0]))
+            e_idx = min(max_response_length, int(span[1]))
+            if e_idx > s_idx:
+              valid_spans.append((s_idx, e_idx))
+      if valid_spans:
+        for k_idx, (s_idx, e_idx) in enumerate(valid_spans, start=1):
+          span_mask = padded_mask[s_idx:e_idx] != 0
+          turn_ids_row[s_idx:e_idx] = np.where(span_mask, k_idx, 0)
+        if np.all(turn_ids_row == 0) and np.any(padded_mask != 0):
+          turn_ids_row = np.where(padded_mask != 0, 1, 0).astype(np.int32)
+      else:
+        in_run = False
+        run_id = 0
+        for tok_i in range(max_response_length):
+          if padded_mask[tok_i] != 0:
+            if not in_run:
+              run_id += 1
+              in_run = True
+            turn_ids_row[tok_i] = run_id
+          else:
+            in_run = False
+      padded_turn_ids.append(turn_ids_row)
+
+      if self.algo_config.use_rollout_logps or has_any_old_logprobs:
         if old_logprobs is not None:
           padded_old_logprobs.append(
               agentic_utils.right_pad(
@@ -619,6 +696,10 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
     prompt_mask = prompt_ids != pad_value
     completion_ids = jnp.asarray(padded_completion_ids)
     completion_mask = jnp.asarray(padded_completion_masks)
+    token_flags_2d = np.asarray(padded_token_flags, dtype=np.int8)
+    turn_ids = jnp.asarray(padded_turn_ids, dtype=jnp.int32)
+    max_turn_id = int(np.max(padded_turn_ids)) if padded_turn_ids else 0
+    num_turn_segments = max(16, max_turn_id + 1)
     completion_attention_mask = None
     token_mask = None
     if self.algo_config.exact_token_continuity:
@@ -648,22 +729,29 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
     have_actor_mesh = actor_mesh is not None and not actor_mesh.empty
     # pack-first: defer old/ref logp to the packed buffer (computed after
     # pack_sequences in the consumer). Leave the non-packed path untouched.
-    is_packed = (
-        self.rl_engine.cluster_config.training_config.max_seq_token_per_tpu
-        is not None
-    )
+    training_cfg = self.rl_engine.cluster_config.training_config
+    is_packed = getattr(training_cfg, "max_seq_token_per_tpu", None) is not None
 
     configured_compute_logps = (
-        self.rl_engine.cluster_config.training_config.compute_logps_micro_batch_size
+        getattr(training_cfg, "compute_logps_micro_batch_size", None)
+        or getattr(training_cfg, "train_micro_batch_size", None)
+        or getattr(training_cfg, "mini_batch_size", None)
     )
     compute_logps_micro_batch_size = (
-        configured_compute_logps * self.algo_config.num_generations
+        min(
+            configured_compute_logps * self.algo_config.num_generations,
+            len(trajectories),
+        )
         if configured_compute_logps
         else len(trajectories)
     )
 
     can_fuse_in_loss = self._can_fuse_agreement_in_loss()
-    rollout_per_token_logps = None
+    rollout_per_token_logps = (
+        jnp.asarray(padded_old_logprobs)
+        if (has_any_old_logprobs and padded_old_logprobs)
+        else None
+    )
     trainer_per_token_logps = None
     if self.algo_config.use_rollout_logps and padded_old_logprobs:
       rollout_per_token_logps = jnp.asarray(padded_old_logprobs)
@@ -700,7 +788,16 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
           or self.algo_config.seq_logprob_error_threshold is not None
       ) and trainer_per_token_logps is not None:
         old_per_token_logps = trainer_per_token_logps
-    elif self.algo_config.use_rollout_logps or is_packed or can_fuse_in_loss:
+    elif self.algo_config.use_rollout_logps or is_packed:
+      old_per_token_logps = None
+    elif (
+        can_fuse_in_loss
+        and rollout_per_token_logps is None
+        and self.algo_config.sampler_is is None
+        and self.algo_config.sampler_rs is None
+        and self.algo_config.seq_logprob_error_threshold is None
+        and configured_compute_logps is None
+    ):
       old_per_token_logps = None
     else:
       trainer_per_token_logps = self.rl_engine.get_actor_per_token_logps(
@@ -775,6 +872,18 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
         key: value for key, value in original_inputs.items() if key != "prompts"
     }
     reward_kwargs["trajectory_rewards"] = trajectory_rewards_list
+    shaping_stats: dict[str, Any] = {}
+    num_trajs = len(trajectories)
+    passed_arr = np.zeros(num_trajs, dtype=bool)
+    lengths_arr = np.asarray(completion_mask.sum(axis=-1), dtype=np.float32)
+    quality_arr = np.ones(num_trajs, dtype=np.float32)
+    has_judge_meta = False
+    hack_count = 0
+    fallback_count = 0
+    judge_latencies: list[float] = []
+    offset_fallbacks: list[float] = []
+    reason_counts: dict[str, int] = {}
+
     with self.rl_engine.perf_v2.span(
         perf_constants.ADVANTAGE_COMPUTATION,
         tags=perf_tags,
@@ -786,13 +895,64 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
           **reward_kwargs,
           expected_step=expected_step,
       )
+      rewards_np = np.asarray(rewards, dtype=np.float32)
+      for idx, item in enumerate(trajectories):
+        jmeta = item.traj.get("judge")
+        if isinstance(jmeta, dict):
+          has_judge_meta = True
+          passed_arr[idx] = bool(jmeta["passed"])
+          quality_arr[idx] = float(jmeta["quality"])
+          if "assistant_len" in jmeta:
+            lengths_arr[idx] = float(jmeta["assistant_len"])
+          if jmeta.get("is_hack", False):
+            hack_count += 1
+          if jmeta.get("fallback", False):
+            fallback_count += 1
+          if "latency_s" in jmeta:
+            judge_latencies.append(float(jmeta["latency_s"]))
+          if "offsets_fallback_frac" in jmeta:
+            offset_fallbacks.append(float(jmeta["offsets_fallback_frac"]))
+          for rsn, cnt in jmeta.get("reason_hist", {}).items():
+            reason_counts[rsn] = reason_counts.get(rsn, 0) + int(cnt)
+        else:
+          passed_arr[idx] = bool(rewards_np[idx] > 0.0)
 
       advantage_estimator = function_registry.get_advantage_estimator(
           self.algo_config.advantage_estimator
       )
-      advantages = advantage_estimator(
-          rewards=rewards, num_generations=self.algo_config.num_generations
+      accepts_var_kw = any(
+          p.kind == inspect.Parameter.VAR_KEYWORD
+          for p in inspect.signature(advantage_estimator).parameters.values()
       )
+      if self.algo_config.advantage_estimator == "mimo" or accepts_var_kw:
+        advantages = advantage_estimator(
+            rewards=rewards,
+            num_generations=self.algo_config.num_generations,
+            passed=passed_arr,
+            lengths=lengths_arr,
+            quality=quality_arr,
+            token_flags=token_flags_2d,
+            completion_mask=np.asarray(completion_mask),
+            cfg=self.algo_config.mimo,
+            stats_out=shaping_stats,
+        )
+      else:
+        advantages = advantage_estimator(
+            rewards=rewards, num_generations=self.algo_config.num_generations
+        )
+      if (
+          self.algo_config.token_advantage_mode == "mask"
+          and advantages.ndim == 1
+      ):
+        advantages = jnp.asarray(
+            advantage_shaping.hard_mask_token_advantages(
+                np.asarray(advantages),
+                token_flags_2d,
+                np.asarray(completion_mask),
+            )
+        )
+      elif isinstance(advantages, np.ndarray):
+        advantages = jnp.asarray(advantages)
 
     logging.debug("Advantages computed: %s", advantages)
 
@@ -803,7 +963,15 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
     raw_completion_lengths_np = np.asarray(
         raw_completion_lengths, dtype=np.int32
     )
-    metrics_to_log = {
+    adv_np = np.asarray(advantages, dtype=np.float32)
+    if adv_np.ndim == 2:
+      comp_mask_f = (np.asarray(completion_mask) != 0).astype(np.float32)
+      seq_tok_counts = np.maximum(np.sum(comp_mask_f, axis=-1), 1.0)
+      seq_adv_means = np.sum(adv_np * comp_mask_f, axis=-1) / seq_tok_counts
+      adv_mean_val = float(np.mean(seq_adv_means))
+    else:
+      adv_mean_val = float(np.mean(adv_np))
+    metrics_to_log: dict[str, Any] = {
         "generation/completions/mean_length": (
             np.mean(agg_completion_mask),
             np.mean,
@@ -836,11 +1004,121 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
             clipped_completion_count / len(trajectories),
             np.mean,
         ),
-        "rewards/advantage/mean": (np.mean(advantages), np.mean),
+        "rewards/advantage/mean": (adv_mean_val, np.mean),
         "rewards/advantage/max": (np.max(advantages), np.max),
         "rewards/advantage/min": (np.min(advantages), np.min),
         "rewards/advantage/std": (np.std(advantages), np.mean),
     }
+
+    if (
+        has_judge_meta
+        or shaping_stats
+        or self.algo_config.token_advantage_mode != "none"
+    ):
+      comp_mask_np = np.asarray(completion_mask) != 0
+      total_assist_tokens = max(int(np.sum(comp_mask_np)), 1)
+      flagged_tokens = int(np.sum((token_flags_2d != 0) & comp_mask_np))
+      gar_quality_mean = (
+          float(np.mean(quality_arr[passed_arr]))
+          if np.any(passed_arr)
+          else 1.0
+      )
+      metrics_to_log.update({
+          "judge/flagged_token_frac": (
+              float(flagged_tokens) / float(total_assist_tokens),
+              np.mean,
+          ),
+          "judge/gar_quality_mean": (gar_quality_mean, np.mean),
+          "judge/hack_frac": (
+              float(hack_count) / float(max(num_trajs, 1)),
+              np.mean,
+          ),
+          "judge/fallback_frac": (
+              float(fallback_count) / float(max(num_trajs, 1)),
+              np.mean,
+          ),
+          "judge/latency_s": (
+              float(np.mean(judge_latencies)) if judge_latencies else 0.0,
+              np.mean,
+          ),
+          "advantage/alpha": (
+              float(shaping_stats.get("advantage/alpha", 1.0)),
+              np.mean,
+          ),
+          "advantage/beta": (
+              float(shaping_stats.get("advantage/beta", 1.0)),
+              np.mean,
+          ),
+          "advantage/lambda": (
+              float(shaping_stats.get("advantage/lambda", 1.0)),
+              np.mean,
+          ),
+          "advantage/gar_lambda_mean": (
+              float(shaping_stats.get("advantage/gar_lambda_mean", 1.0)),
+              np.mean,
+          ),
+          "advantage/gar_applied_frac": (
+              float(shaping_stats.get("advantage/gar_applied_frac", 0.0)),
+              np.mean,
+          ),
+          "advantage/span_alpha_mean": (
+              float(shaping_stats.get("advantage/span_alpha_mean", 1.0)),
+              np.mean,
+          ),
+          "advantage/span_beta_mean": (
+              float(shaping_stats.get("advantage/span_beta_mean", 1.0)),
+              np.mean,
+          ),
+          "advantage/alpha_capped_frac": (
+              float(shaping_stats.get("advantage/alpha_capped_frac", 0.0)),
+              np.mean,
+          ),
+          "advantage/beta_floored_frac": (
+              float(shaping_stats.get("advantage/beta_floored_frac", 0.0)),
+              np.mean,
+          ),
+          "advantage/mass_pos_before": (
+              float(shaping_stats.get("mass_pos_before", 0.0)),
+              np.mean,
+          ),
+          "advantage/mass_pos_after": (
+              float(shaping_stats.get("mass_pos_after", 0.0)),
+              np.mean,
+          ),
+          "advantage/mass_neg_before": (
+              float(shaping_stats.get("mass_neg_before", 0.0)),
+              np.mean,
+          ),
+          "advantage/mass_neg_after": (
+              float(shaping_stats.get("mass_neg_after", 0.0)),
+              np.mean,
+          ),
+          "advantage/mass_pos_ratio": (
+              float(shaping_stats.get("mass_pos_ratio", 1.0)),
+              np.mean,
+          ),
+          "advantage/mass_neg_ratio": (
+              float(shaping_stats.get("mass_neg_ratio", 1.0)),
+              np.mean,
+          ),
+          "length_penalty/mean": (
+              float(shaping_stats.get("length_penalty/mean", 0.0)),
+              np.mean,
+          ),
+          "length_penalty/applied_frac": (
+              float(shaping_stats.get("length_penalty/applied_frac", 0.0)),
+              np.mean,
+          ),
+          "offsets/fallback_frac": (
+              float(np.mean(offset_fallbacks)) if offset_fallbacks else 0.0,
+              np.mean,
+          ),
+      })
+      for rsn, cnt in reason_counts.items():
+        metrics_to_log[f"judge/reason/{rsn}_frac"] = (
+            float(cnt) / float(max(num_trajs, 1)),
+            np.mean,
+        )
 
     # None-safe: under packing the trainer logps stay None here and this same
     # call runs in _compute_packed_logps instead.
@@ -923,6 +1201,9 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
         completion_attention_mask=completion_attention_mask,
         routed_experts=routed_experts,
         sampler_agreement_applied=trainer_per_token_logps is not None,
+        token_mask=token_mask,
+        turn_ids=turn_ids,
+        num_turn_segments=num_turn_segments,
     )
     return [combined_batch]
 

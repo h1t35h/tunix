@@ -176,6 +176,8 @@ class TokenizerAdapter:
         }
         for m in messages
     ]
+    if tokenize and 'return_dict' not in kwargs:
+      kwargs['return_dict'] = False
     if self._tokenizer_type == TokenizerType.HF:
       return self._tokenizer.apply_chat_template(
           messages,

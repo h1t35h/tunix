@@ -219,9 +219,18 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
     # Convert completion_ids and completion_mask to jax arrays
     jax_completion_ids = jnp.array(padded_completion_ids)
     jax_completion_mask = jnp.array(completion_mask)
+    training_cfg = self.rl_engine.cluster_config.training_config
+    configured_compute_logps = (
+        self._compute_logps_micro_batch_size
+        or getattr(training_cfg, "train_micro_batch_size", None)
+        or getattr(training_cfg, "mini_batch_size", None)
+    )
     compute_logps_micro_batch_size = (
-        self._compute_logps_micro_batch_size * self.algo_config.num_generations
-        if self._compute_logps_micro_batch_size
+        min(
+            configured_compute_logps * self.algo_config.num_generations,
+            len(training_input["prompts"]),
+        )
+        if configured_compute_logps
         else len(training_input["prompts"])
     )
 
@@ -248,10 +257,7 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
     trainer_per_token_logps = None
     old_per_token_logps = None
     sampler_is_weights = None
-    if (
-        self.algo_config.use_rollout_logps
-        and rollout_output.logprobs is not None
-    ):
+    if rollout_output.logprobs is not None:
       rollout_per_token_logps = jnp.asarray([
           utils.pad_to_length(
               np.asarray(logprobs),
@@ -261,7 +267,8 @@ class GRPOLearner(rl_learner.RLLearner[TGrpoConfig]):
           )[: rollout_config.max_tokens_to_generate]
           for logprobs in rollout_output.logprobs
       ])
-      old_per_token_logps = rollout_per_token_logps
+      if self.algo_config.use_rollout_logps:
+        old_per_token_logps = rollout_per_token_logps
     needs_trainer_logps = not self.algo_config.use_rollout_logps or (
         rollout_per_token_logps is not None
         and (

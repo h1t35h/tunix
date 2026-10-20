@@ -522,6 +522,8 @@ class TrajectoryCollectEngine:
           for step in self.agent.trajectory.steps
       )
 
+      assistant_turn_token_spans: List[Tuple[int, int]] = []
+      token_cursor = 0
       for idx, step in enumerate(self.agent.trajectory.steps):
         # Keep tokens/masks/logprobs/routed_experts appended in lockstep.
         assistant_tokens = getattr(step, "assistant_tokens", None)
@@ -530,6 +532,16 @@ class TrajectoryCollectEngine:
         step_routed = getattr(step, "assistant_routed_experts", None)
         step_env_routed = getattr(step, "env_routed_experts", None)
         if assistant_tokens is not None:
+          asst_len = len(assistant_tokens)
+          active_asst_len = (
+              int(np.sum(np.asarray(step.assistant_masks) > 0))
+              if getattr(step, "assistant_masks", None) is not None
+              else asst_len
+          )
+          assistant_turn_token_spans.append(
+              (token_cursor, token_cursor + active_asst_len)
+          )
+          token_cursor += asst_len
           conversation_tokens.append(assistant_tokens)
           conversation_masks.append(step.assistant_masks)
           if step_logprobs is not None:
@@ -555,6 +567,7 @@ class TrajectoryCollectEngine:
               )
             routed_experts.append(np.asarray(step_routed, dtype=np.int16))
         if env_tokens is not None:
+          token_cursor += len(env_tokens)
           conversation_tokens.append(env_tokens)
           conversation_masks.append(step.env_masks)
           logprobs.append(np.zeros(len(env_tokens)))
@@ -643,6 +656,7 @@ class TrajectoryCollectEngine:
             [prompt_routed_arr, conv_routed], axis=0
         )
 
+      env_extras = self.env.export_trajectory_extras()
       result = {
           "conversation_text": self.agent.chat_completions,
           "prompt_tokens": prompt_tokens,
@@ -652,6 +666,11 @@ class TrajectoryCollectEngine:
           # zeroes, so consumers still see how long a masked-out rollout's
           # turns ran.
           "assistant_turn_lengths": list(self._assistant_turn_lengths),
+          "conversation_token_flags": np.zeros(
+              len(conversation_tokens), dtype=np.int8
+          ),
+          "assistant_turn_token_spans": assistant_turn_token_spans,
+          "env_extras": env_extras,
           "status": self.agent.trajectory.status.name,
           "trajectory_reward": self.agent.trajectory.reward,
           "env_time": self.env_time,
