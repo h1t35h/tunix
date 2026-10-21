@@ -17,6 +17,7 @@
 from collections.abc import Sequence
 from typing import Any
 import numpy as np
+from tunix.rl import algo_core
 from tunix.rl import algorithm_config
 from tunix.rl import function_registry
 
@@ -593,29 +594,24 @@ def hard_mask_token_advantages(
 def _group_normalize_advantages(
     rewards: np.ndarray,
     num_generations: int,
-    valid_mask: np.ndarray,
+    valid_mask: np.ndarray | None = None,
     *,
     std_normalize: bool = True,
 ) -> np.ndarray:
-  """Computes group-normalized scalar advantages over valid trajectories."""
-  batch_size = rewards.shape[0]
-  if batch_size == 0:
-    return np.empty(0, dtype=np.float32)
-  num_groups = _validate_group_size(batch_size, num_generations)
-  grouped_r = rewards.reshape(num_groups, num_generations).astype(np.float64)
-  grouped_v = valid_mask.reshape(num_groups, num_generations)
-  valid_counts = np.sum(grouped_v, axis=-1, keepdims=True)
-  masked_sum = np.sum(np.where(grouped_v, grouped_r, 0.0), axis=-1, keepdims=True)
-  mean_r = masked_sum / np.maximum(valid_counts, 1)
-  centered = np.where(grouped_v, grouped_r - mean_r, 0.0)
+  """Computes group-normalized scalar advantages delegating to algo_core."""
   if std_normalize:
-    sq_dev = np.sum(np.where(grouped_v, centered**2, 0.0), axis=-1, keepdims=True)
-    std_r = np.sqrt(sq_dev / np.maximum(valid_counts - 1, 1))
-    adv = centered / (std_r + 1e-6)
-  else:
-    adv = centered
-  adv = np.where(grouped_v & (valid_counts >= 2), adv, 0.0)
-  return adv.reshape(batch_size).astype(np.float32)
+    return np.asarray(
+        algo_core.compute_advantages(
+            rewards, num_generations, valid_mask=valid_mask
+        ),
+        dtype=np.float32,
+    )
+  return np.asarray(
+      algo_core.compute_drgrpo_advantages(
+          rewards, num_generations, valid_mask=valid_mask
+      ),
+      dtype=np.float32,
+  )
 
 
 @function_registry.register_advantage_estimator("mimo")

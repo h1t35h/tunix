@@ -780,30 +780,19 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     items = list(train_micro_batch)
     if len(items) <= 1:
       return items
-    max_turn_segs = max(
-        (getattr(ex, "num_turn_segments", None) or 0 for ex in items),
-        default=0,
-    )
-    if max_turn_segs > 0:
-      items = [
-          dataclasses.replace(ex, num_turn_segments=max_turn_segs)
-          if dataclasses.is_dataclass(ex)
-          and getattr(ex, "num_turn_segments", None) != max_turn_segs
-          else ex
-          for ex in items
-      ]
-    max_segs = max(
-        (getattr(ex, "num_segments", None) or 0 for ex in items),
-        default=0,
-    )
-    if max_segs > 0:
-      items = [
-          dataclasses.replace(ex, num_segments=max_segs)
-          if dataclasses.is_dataclass(ex)
-          and getattr(ex, "num_segments", None) != max_segs
-          else ex
-          for ex in items
-      ]
+    for field_name in ("num_turn_segments", "num_segments"):
+      max_val = max(
+          (getattr(ex, field_name, None) or 0 for ex in items),
+          default=0,
+      )
+      if max_val > 0:
+        items = [
+            dataclasses.replace(ex, **{field_name: max_val})
+            if dataclasses.is_dataclass(ex)
+            and getattr(ex, field_name, None) != max_val
+            else ex
+            for ex in items
+        ]
     return items
 
   def train(

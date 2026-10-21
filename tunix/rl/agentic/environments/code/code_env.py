@@ -182,6 +182,37 @@ class PythonCodeEnv(base_environment.BaseTaskEnv):
         info=result.info,
     )
 
+  def _record_turn_and_result(
+      self,
+      *,
+      turn_idx: int,
+      action_text: str,
+      code: str,
+      code_span: tuple[int, int],
+      test_res: TestResult,
+      local_spans: list[CharSpanFlag],
+      observation: str,
+      reward: float,
+      done: bool,
+      passed: bool,
+  ) -> base_environment.EnvStepResult:
+    self._turn_records.append(
+        TurnRecord(
+            turn_idx=turn_idx,
+            response_text=action_text,
+            code=code,
+            code_char_span=code_span,
+            test_result=test_res,
+            local_flag_spans=local_spans,
+        )
+    )
+    return base_environment.EnvStepResult(
+        observation=observation[: self.max_obs_chars],
+        reward=reward,
+        done=done,
+        info={"passed": passed, "turn_idx": turn_idx},
+    )
+
   def _step_impl(self, action: Any) -> base_environment.EnvStepResult:
     action_text = str(action)
     turn_idx = max(0, self.step_count - 1)
@@ -202,21 +233,17 @@ class PythonCodeEnv(base_environment.BaseTaskEnv):
           " ```python ... ``` block."
       )
       done = self.step_count >= self.max_steps
-      self._turn_records.append(
-          TurnRecord(
-              turn_idx=turn_idx,
-              response_text=action_text,
-              code="",
-              code_char_span=code_span,
-              test_result=test_res,
-              local_flag_spans=local_spans,
-          )
-      )
-      return base_environment.EnvStepResult(
-          observation=obs[: self.max_obs_chars],
+      return self._record_turn_and_result(
+          turn_idx=turn_idx,
+          action_text=action_text,
+          code="",
+          code_span=code_span,
+          test_res=test_res,
+          local_spans=local_spans,
+          observation=obs,
           reward=0.0,
           done=done,
-          info={"passed": False, "turn_idx": turn_idx},
+          passed=False,
       )
 
     if syntax_err is not None:
@@ -224,21 +251,17 @@ class PythonCodeEnv(base_environment.BaseTaskEnv):
       test_res = TestResult(passed_count=0, total=1, error=err_msg)
       obs = f"Your code failed to parse:\n{err_msg}"
       done = self.step_count >= self.max_steps
-      self._turn_records.append(
-          TurnRecord(
-              turn_idx=turn_idx,
-              response_text=action_text,
-              code=code,
-              code_char_span=code_span,
-              test_result=test_res,
-              local_flag_spans=local_spans,
-          )
-      )
-      return base_environment.EnvStepResult(
-          observation=obs[: self.max_obs_chars],
+      return self._record_turn_and_result(
+          turn_idx=turn_idx,
+          action_text=action_text,
+          code=code,
+          code_span=code_span,
+          test_res=test_res,
+          local_spans=local_spans,
+          observation=obs,
           reward=0.0,
           done=done,
-          info={"passed": False, "turn_idx": turn_idx},
+          passed=False,
       )
 
     tests_spec = self.task.get("tests", [])
@@ -272,23 +295,19 @@ class PythonCodeEnv(base_environment.BaseTaskEnv):
         if f.traceback_tail:
           detail += f"\n{f.traceback_tail}"
         fail_summaries.append(detail)
-      obs = "\n".join(fail_summaries)[: self.max_obs_chars]
+      obs = "\n".join(fail_summaries)
 
-    self._turn_records.append(
-        TurnRecord(
-            turn_idx=turn_idx,
-            response_text=action_text,
-            code=code,
-            code_char_span=code_span,
-            test_result=test_res,
-            local_flag_spans=local_spans,
-        )
-    )
-    return base_environment.EnvStepResult(
+    return self._record_turn_and_result(
+        turn_idx=turn_idx,
+        action_text=action_text,
+        code=code,
+        code_span=code_span,
+        test_res=test_res,
+        local_spans=local_spans,
         observation=obs,
         reward=reward,
         done=done,
-        info={"passed": all_passed, "turn_idx": turn_idx},
+        passed=all_passed,
     )
 
   def export_trajectory_extras(self) -> dict[str, Any]:

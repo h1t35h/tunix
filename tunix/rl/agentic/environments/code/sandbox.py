@@ -30,6 +30,13 @@ from tunix.rl.agentic.environments.code import schemas
 TestFailure = schemas.TestFailure
 TestResult = schemas.TestResult
 
+TIMEOUT_RETURNCODES: tuple[int, ...] = (
+    -int(signal.SIGXCPU),
+    -int(signal.SIGKILL),
+    128 + int(signal.SIGKILL),
+    128 + int(signal.SIGXCPU),
+)
+
 
 def _normalize_stdio_output(text: str) -> str:
   lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -241,7 +248,7 @@ class SandboxRunner:
               error="",
           )
 
-      timed_out = proc.returncode in (-24, -9, 137, 152)
+      timed_out = proc.returncode in TIMEOUT_RETURNCODES
       err_text = _strip_temp_paths(proc.stderr or proc.stdout, tmpdir)
       return TestResult(
           passed_count=0,
@@ -307,7 +314,7 @@ class SandboxRunner:
           )
 
         if proc.returncode != 0:
-          timed_out = proc.returncode in (-24, -9, 137, 152)
+          timed_out = proc.returncode in TIMEOUT_RETURNCODES
           tb_tail = _strip_temp_paths(proc.stderr or proc.stdout, tmpdir)
           if len(failures) < 3:
             failures.append(

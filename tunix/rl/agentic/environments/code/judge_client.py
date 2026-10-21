@@ -62,6 +62,45 @@ def _make_audit_cache_key(
   return hashlib.sha256(json.dumps(key_obj).encode("utf-8")).hexdigest()
 
 
+class AuditCache:
+  """Unified deterministic in-memory cache for group solution audits."""
+
+  def __init__(self) -> None:
+    self._store: dict[str, dict[str, Any]] = {}
+
+  def get(
+      self, problem: str, passing_solutions: dict[int, str]
+  ) -> dict[str, Any] | None:
+    key = _make_audit_cache_key(problem, passing_solutions)
+    if key in self._store:
+      return copy.deepcopy(self._store[key])
+    return None
+
+  def set(
+      self,
+      problem: str,
+      passing_solutions: dict[int, str],
+      result: dict[str, Any],
+  ) -> None:
+    key = _make_audit_cache_key(problem, passing_solutions)
+    self._store[key] = copy.deepcopy(result)
+
+  def __contains__(self, key: str) -> bool:
+    return key in self._store
+
+  def __getitem__(self, key: str) -> dict[str, Any]:
+    return self._store[key]
+
+  def __setitem__(self, key: str, value: dict[str, Any]) -> None:
+    self._store[key] = value
+
+  def __len__(self) -> int:
+    return len(self._store)
+
+  def clear(self) -> None:
+    self._store.clear()
+
+
 @runtime_checkable
 class JudgeClient(Protocol):
   """Protocol for trajectory segment tagging and group solution auditing."""
@@ -98,17 +137,26 @@ class OpenAICompatJudgeClient:
       max_concurrency: int = 16,
       timeout_s: float = 30.0,
       max_retries: int = 2,
+      max_tokens: int = 512,
+      enable_thinking: bool = False,
   ) -> None:
     self.base_url = base_url.rstrip("/")
     self.model = model
     self.api_key = api_key
     self.timeout_s = timeout_s
     self.max_retries = max_retries
+    self.max_tokens = max_tokens
+    self.enable_thinking = enable_thinking
     self._sem = asyncio.Semaphore(max_concurrency)
-    self._audit_cache: dict[str, dict[str, Any]] = {}
+    self._audit_cache = AuditCache()
 
   def _post_json_sync(self, payload: dict[str, Any]) -> dict[str, Any]:
-    data = json.dumps(payload).encode("utf-8")
+    req_payload = dict(payload)
+    req_payload.setdefault("max_tokens", self.max_tokens)
+    req_payload.setdefault(
+        "chat_template_kwargs", {"enable_thinking": self.enable_thinking}
+    )
+    data = json.dumps(req_payload).encode("utf-8")
     req = request.Request(
         f"{self.base_url}/chat/completions",
         data=data,
@@ -121,7 +169,29 @@ class OpenAICompatJudgeClient:
     with request.urlopen(req, timeout=self.timeout_s) as resp:
       body = json.loads(resp.read().decode("utf-8"))
     content = str(body["choices"][0]["message"]["content"])
-    return json.loads(_strip_code_fences(content))
+    cleaned = _strip_code_fences(content)
+    try:
+      return json.loads(cleaned)
+    except json.JSONDecodeError:
+      if '"segments"' in cleaned or '"hacks"' in cleaned or '"tags"' in cleaned:
+        seen_ids: set[int] = set()
+        segs: list[dict[str, Any]] = []
+        for m in re.finditer(
+            r'\{\s*"id"\s*:\s*(\d+)\s*,\s*"label"\s*:\s*"(useful|faulty)"\s*,\s*"reason"\s*:\s*"([^"]+)"\s*\}',
+            cleaned,
+        ):
+          sid = int(m.group(1))
+          if sid not in seen_ids:
+            seen_ids.add(sid)
+            segs.append({"id": sid, "label": m.group(2), "reason": m.group(3)})
+        return {
+            "segments": segs,
+            "turn_summary": [],
+            "hacks": [],
+            "scores": {},
+            "ranking": [],
+        }
+      raise
 
   async def _chat_json(
       self,
@@ -138,6 +208,8 @@ class OpenAICompatJudgeClient:
         "model": self.model,
         "messages": messages,
         "temperature": 0.0,
+        "max_tokens": self.max_tokens,
+        "chat_template_kwargs": {"enable_thinking": self.enable_thinking},
         "response_format": {
             "type": "json_schema",
             "json_schema": {"name": "judge_response", "schema": schema},
@@ -210,12 +282,12 @@ class OpenAICompatJudgeClient:
       problem: str,
       passing_solutions: dict[int, str],
   ) -> dict[str, Any]:
-    cache_key = _make_audit_cache_key(problem, passing_solutions)
-    if cache_key in self._audit_cache:
-      return copy.deepcopy(self._audit_cache[cache_key])
+    cached = self._audit_cache.get(problem, passing_solutions)
+    if cached is not None:
+      return cached
     prompt = prompts_lib.build_group_audit_prompt(problem, passing_solutions)
     res = await self._chat_json(prompt, prompts_lib.GROUP_AUDIT_JSON_SCHEMA)
-    self._audit_cache[cache_key] = copy.deepcopy(res)
+    self._audit_cache.set(problem, passing_solutions, res)
     return res
 
 
@@ -240,7 +312,7 @@ class MockJudgeClient:
     self.latency_s = latency_s
     self.tag_call_count = 0
     self.audit_call_count = 0
-    self._audit_cache: dict[str, dict[str, Any]] = {}
+    self._audit_cache = AuditCache()
 
   async def tag_trajectory_segments(
       self,
@@ -305,14 +377,11 @@ class MockJudgeClient:
     if self.fail_mode == "http_error":
       raise RuntimeError("HTTP 503 Service Unavailable")
 
-    cache_key = _make_audit_cache_key(problem, passing_solutions)
     self.audit_call_count += 1
-    if (
-        cache_key in self._audit_cache
-        and self.ranking_override is None
-        and not self.hack_ids
-    ):
-      return copy.deepcopy(self._audit_cache[cache_key])
+    if self.ranking_override is None and not self.hack_ids:
+      cached = self._audit_cache.get(problem, passing_solutions)
+      if cached is not None:
+        return cached
 
     hacks: list[dict[str, Any]] = []
     clean_ids: list[int] = []
@@ -341,5 +410,5 @@ class MockJudgeClient:
       )
 
     result = {"hacks": hacks, "scores": scores, "ranking": ranking}
-    self._audit_cache[cache_key] = copy.deepcopy(result)
+    self._audit_cache.set(problem, passing_solutions, result)
     return result

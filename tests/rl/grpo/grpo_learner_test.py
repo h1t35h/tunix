@@ -475,7 +475,11 @@ class GRPOLearnerTest(parameterized.TestCase):
         np.asarray(train_example.old_per_token_logps),
         np.full(train_example.completion_ids.shape, -5.0, dtype=np.float32),
     )
-    self.assertIsNone(train_example.sampler_is_weights)
+    self.assertIsNotNone(train_example.sampler_is_weights)
+    self.assertEqual(
+        train_example.sampler_is_weights.shape,
+        train_example.completion_ids.shape,
+    )
 
   def test_vllm_missing_rollout_logps_does_not_recompute_on_rollout(self):
     rl_engine, _, _ = setup(

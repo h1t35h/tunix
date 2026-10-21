@@ -30,7 +30,6 @@ The data flow is designed around an asynchronous producer-consumer pattern:
 from __future__ import annotations
 
 import dataclasses
-import inspect
 from typing import Any, Dict, List, Sequence, Type, TypeVar
 
 from absl import logging
@@ -920,11 +919,7 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
       advantage_estimator = function_registry.get_advantage_estimator(
           self.algo_config.advantage_estimator
       )
-      accepts_var_kw = any(
-          p.kind == inspect.Parameter.VAR_KEYWORD
-          for p in inspect.signature(advantage_estimator).parameters.values()
-      )
-      if self.algo_config.advantage_estimator == "mimo" or accepts_var_kw:
+      if self.algo_config.advantage_estimator == "mimo":
         advantages = advantage_estimator(
             rewards=rewards,
             num_generations=self.algo_config.num_generations,

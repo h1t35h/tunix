@@ -17,10 +17,12 @@
 import asyncio
 import dataclasses
 import hashlib
-import inspect
+import json
+import logging
 import re
 import time
 from typing import Any
+from urllib import error as urllib_error
 import numpy as np
 from tunix.rl import advantage_shaping
 from tunix.rl.agentic.agents import agent_types
@@ -144,30 +146,20 @@ class CodeJudgeGroupPostProcessor:
       try:
         tag_tasks = []
         tag_fn = self.judge_client.tag_trajectory_segments
-        tag_params = inspect.signature(tag_fn).parameters
-        accepts_max_faulty = "max_faulty_segments_per_turn" in tag_params or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD
-            for p in tag_params.values()
-        )
         for idx, item in enumerate(group):
           traj = _unwrap_traj(item)
           extras = traj.get("env_extras", {})
           turn_records = list(extras.get("turn_records", []))
           test_results = [tr.test_result for tr in turn_records]
           problem = str(extras.get("problem", ""))
-          if accepts_max_faulty:
-            tag_tasks.append(
-                tag_fn(
-                    problem,
-                    all_segments_by_item[idx],
-                    test_results,
-                    max_faulty_segments_per_turn=self.max_faulty_segments_per_turn,
-                )
-            )
-          else:
-            tag_tasks.append(
-                tag_fn(problem, all_segments_by_item[idx], test_results)
-            )
+          tag_tasks.append(
+              tag_fn(
+                  problem,
+                  all_segments_by_item[idx],
+                  test_results,
+                  max_faulty_segments_per_turn=self.max_faulty_segments_per_turn,
+              )
+          )
         tag_outputs = list(await asyncio.gather(*tag_tasks))
         if passing_candidates:
           first_traj = _unwrap_traj(group[0])
@@ -175,7 +167,18 @@ class CodeJudgeGroupPostProcessor:
           audit_output = await self.judge_client.audit_group_solutions(
               problem, passing_candidates
           )
-      except Exception:  # pylint: disable=broad-exception-caught
+      except (
+          urllib_error.URLError,
+          TimeoutError,
+          json.JSONDecodeError,
+          KeyError,
+          ValueError,
+      ) as exc:
+        logging.warning(
+            "Judge execution failed (%s); using fallback annotations: %s",
+            type(exc).__name__,
+            exc,
+        )
         fallback_used = True
         tag_outputs = [
             {"segments": [], "turn_summary": []} for _ in range(num_items)
@@ -305,14 +308,21 @@ class CodeJudgeGroupPostProcessor:
             reason_hist.get("TEST_HARDCODING", 0) + 1
         )
       eff_pass = bool(effective_passed[idx])
+      turn1_passed = (
+          bool(turn_records[0].test_result.all_passed)
+          if turn_records
+          else False
+      )
 
       traj["conversation_token_flags"] = token_flags
       traj["trajectory_reward"] = 1.0 if eff_pass else 0.0
       traj["judge"] = {
           "passed": eff_pass,
+          "turn1_passed": turn1_passed,
+          "final_passed": eff_pass,
+          "assistant_len": int(np.sum(conv_masks != 0)),
           "is_hack": is_hack,
           "quality": float(qualities[idx]),
-          "assistant_len": int(np.sum(conv_masks != 0)),
           "reason_hist": reason_hist,
           "latency_s": elapsed_s,
           "fallback": fallback_used,

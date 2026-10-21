@@ -15,7 +15,7 @@
 """Data schemas for multi-turn Python coding RL environment and judge."""
 
 import dataclasses
-from typing import Literal
+from typing import Any, Literal
 
 LOCAL_RULE_REASONS: tuple[str, ...] = (
     "SYNTAX",
@@ -97,3 +97,38 @@ class Segment:
   tok_span: tuple[int, int]
   text_preview: str
   text: str = ""
+
+
+@dataclasses.dataclass(slots=True)
+class SegmentTag:
+  """Single segment annotation returned by the judge."""
+
+  id: int
+  label: str  # "useful" | "faulty"
+  reason: str = "OK"
+
+
+@dataclasses.dataclass(slots=True)
+class TagTrajectoryResult:
+  """Result of tagging all segments in a single trajectory."""
+
+  segments: list[SegmentTag] = dataclasses.field(default_factory=list)
+  turn_summary: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass(slots=True)
+class HackRecord:
+  """Flagged reward hacking trajectory."""
+
+  id: int
+  reason: str
+
+
+@dataclasses.dataclass(slots=True)
+class GroupAuditResult:
+  """Result of group solution audit."""
+
+  hacks: list[HackRecord] = dataclasses.field(default_factory=list)
+  scores: dict[str, dict[str, int]] = dataclasses.field(default_factory=dict)
+  ranking: list[int] = dataclasses.field(default_factory=list)
+
