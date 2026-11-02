@@ -47,12 +47,13 @@ from tunix.rl.agentic.agents import base_agent
 from tunix.rl.agentic.agents import model_agent
 from tunix.rl.agentic.environments import base_environment
 from tunix.rl.agentic.environments import task_environment
-from tunix.utils import compat
+from tunix.rl.agentic.pipeline import group_postprocess
 from tunix.rl.agentic.pipeline import rollout_orchestrator
 from tunix.rl.agentic.rewards import reward  # pylint: disable=unused-import
 from tunix.rl.agentic.trajectory import trajectory_collect_engine
 from tunix.rl.queue import data_queue as queue_lib
 from tunix.sft import utils as sft_utils
+from tunix.utils import compat
 
 ArrayLike = typing.ArrayLike
 TrainingInputT = Dict[str, List[str] | ArrayLike]
@@ -108,6 +109,12 @@ TConfig = TypeVar("TConfig", bound=AgenticRLConfig)
 class AgenticRLLearner(abc.ABC, Generic[TConfig]):
   """Base class for Agentic RL Learners using asynchronous rollouts."""
 
+  group_postprocessor: group_postprocess.GroupPostProcessor | None = None
+  group_max_in_flight: int = 8
+  group_stage_timeout_s: float = 90.0
+  _group_max_in_flight: int = 8
+  _group_stage_timeout_s: float = 90.0
+
   class _AsyncQueueIterator:
     """Async iterator that yields items from a sync queue."""
 
@@ -144,6 +151,9 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
           base_environment.BaseTaskEnv
       ] = task_environment.TaskEnvironment,
       env_kwargs: Dict[str, Any] | None = None,
+      group_postprocessor: group_postprocess.GroupPostProcessor | None = None,
+      group_max_in_flight: int = 8,
+      group_stage_timeout_s: float = 90.0,
   ):
     """Initializes the `AgenticRLLearner`.
 
@@ -164,6 +174,11 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       agent_kwargs: Keyword arguments for the agent class.
       env_class: User defined environment class.
       env_kwargs: Keyword arguments for the environment class.
+      group_postprocessor: Optional async post-processor over trajectory groups.
+      group_max_in_flight: Maximum concurrent trajectory groups in
+        `BoundedGroupStage`.
+      group_stage_timeout_s: Per-group timeout in seconds for
+        `BoundedGroupStage`.
     """
     self.rl_engine = rl_engine
     self.algo_config = algo_config
@@ -188,6 +203,11 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     self.agent_kwargs = agent_kwargs or {}
     self.env_class = env_class
     self.env_kwargs = env_kwargs or {}
+    self.group_postprocessor = group_postprocessor
+    self.group_max_in_flight = group_max_in_flight
+    self.group_stage_timeout_s = group_stage_timeout_s
+    self._group_max_in_flight = group_max_in_flight
+    self._group_stage_timeout_s = group_stage_timeout_s
 
     self.rl_engine.global_steps = (
         self.rl_engine.actor_trainer.restored_global_step()
@@ -226,7 +246,7 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
         self._training_config.rollout_micro_batch_size
     )
     self._compute_logps_micro_batch_size = (
-        self._training_config.compute_logps_micro_batch_size or 1
+        self._training_config.compute_logps_micro_batch_size
     )
     sft_utils.show_hbm_usage(title="AgenticRLLearner init")
 
@@ -237,6 +257,7 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     self._background_tasks: Set[asyncio.Task] = set()
     self._full_batch_size = 0
     self._process_in_consumer: bool = False
+    self._step_telemetry_history: List[Dict[str, Any]] = []
 
     loop_queue = queue.Queue()
 
@@ -679,6 +700,20 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     """Returns the number of generations per prompt."""
     return self.algo_config.num_generations
 
+  def _wrap_group_stream(
+      self,
+      group_stream: AsyncIterator[list[Any]],
+  ) -> AsyncIterator[list[Any]]:
+    """Wraps a group stream with `BoundedGroupStage` when configured."""
+    if self.group_postprocessor is None:
+      return group_stream
+    stage = group_postprocess.BoundedGroupStage(
+        self.group_postprocessor,
+        max_in_flight=self._group_max_in_flight,
+        timeout_s=self._group_stage_timeout_s,
+    )
+    return stage.wrap(group_stream)
+
   async def _producer(
       self,
       orchestrator,
@@ -695,13 +730,16 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
           yield prompt
 
     prompt_iterator = _iterate_micro_batches()
+    group_stream = self._wrap_group_stream(
+        self._orchestrator_producer(
+            orchestrator=orchestrator,
+            prompt_iterator=prompt_iterator,
+            num_generations=self.algo_config.num_generations,
+            collect_mode="Token",
+        )
+    )
     try:
-      async for batch in self._orchestrator_producer(
-          orchestrator=orchestrator,
-          prompt_iterator=prompt_iterator,
-          num_generations=self.algo_config.num_generations,
-          collect_mode="Token",
-      ):
+      async for batch in group_stream:
         try:
           if self._process_in_consumer:
             # Put raw batch (list of trajectories) into queue.
@@ -737,6 +775,38 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       if not batch:
         return  # The iterator is exhausted.
       yield batch
+
+  @staticmethod
+  def _normalize_micro_batch_metadata(
+      train_micro_batch: Sequence[TrainExample],
+  ) -> List[TrainExample]:
+    """Normalizes static PyTree metadata (`num_turn_segments`, `num_segments`) across a micro-batch."""
+    items = list(train_micro_batch)
+    if len(items) <= 1 or not isinstance(items[0], common.TrainExample):
+      return items
+    max_turn = max(
+        (ex.num_turn_segments or 0 for ex in items),
+        default=0,
+    )
+    if max_turn > 0:
+      items = [
+          dataclasses.replace(ex, num_turn_segments=max_turn)
+          if ex.num_turn_segments != max_turn
+          else ex
+          for ex in items
+      ]
+    max_seg = max(
+        (ex.num_segments or 0 for ex in items),
+        default=0,
+    )
+    if max_seg > 0:
+      items = [
+          dataclasses.replace(ex, num_segments=max_seg)
+          if ex.num_segments != max_seg
+          else ex
+          for ex in items
+      ]
+    return items
 
   def train(
       self,
@@ -790,16 +860,23 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     # prompts.
     self._rollout_micro_batch_size = 1
     self._process_in_consumer = False
+    eff_compute_mb = (
+        self._compute_logps_micro_batch_size or train_micro_batch_size or 1
+    )
+    self._compute_logps_micro_batch_size = eff_compute_mb
+    self._train_micro_batch_size = train_micro_batch_size
 
     # pack-first: with packing on, the pack is the logp batch, so logp is
     # computed on the packed buffer after pack_sequences; do not defer
     # conversion to the consumer (which would enqueue raw lists pack_sequences
-    # cannot consume).
-    if self._compute_logps_micro_batch_size > 1 and not self._packing_enabled:
-      if self._compute_logps_micro_batch_size != train_micro_batch_size:
+    # cannot consume). When not packing, always compute old/ref logps on the
+    # consumer thread before actor updates so producer rollouts never race
+    # against concurrent actor weight updates.
+    if not self._packing_enabled:
+      if eff_compute_mb != train_micro_batch_size:
         raise ValueError(
             "compute_logps_micro_batch_size"
-            f" ({self._compute_logps_micro_batch_size}) must be equal to"
+            f" ({eff_compute_mb}) must be equal to"
             f" train_micro_batch_size ({train_micro_batch_size})"
         )
       self._process_in_consumer = True
@@ -807,8 +884,8 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     for v, n in [
         (self._rollout_micro_batch_size, f"{self._rollout_micro_batch_size=}"),
         (
-            self._compute_logps_micro_batch_size,
-            f"{self._compute_logps_micro_batch_size=}",
+            eff_compute_mb,
+            f"self._compute_logps_micro_batch_size={eff_compute_mb}",
         ),
         (mini_batch_size, f"{mini_batch_size=}"),
     ]:
@@ -817,7 +894,7 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
     logging.info(  # pylint: disable=logging-fstring-interpolation
         f"Training with {full_batch_size=}, {mini_batch_size=},"
         f" {train_micro_batch_size=}, {self._rollout_micro_batch_size=},"
-        f" {self._compute_logps_micro_batch_size=}, {grad_acc_steps=},"
+        f" {eff_compute_mb=}, {grad_acc_steps=},"
         f" {iterator_batch_size=}"
     )
 
@@ -859,17 +936,23 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
         train_data_queue, iterator_batch_size
     )
     if self._process_in_consumer:
-      # Convert raw Trajectory groups into TrainExamples up front, before
-      # `pack_sequences` wraps the generator below. Otherwise `pack_sequences`
-      # (via `unpad_train_example`) receives raw lists and crashes on
-      # `.prompt_ids`.
+      # Convert raw Trajectory groups into TrainExamples on the consumer
+      # thread so old_per_token_logps are always computed deterministically
+      # against the pre-update actor weights.
       def _to_train_examples(raw_gen):
-        for group_batch in raw_gen:
-          all_trajectories = [t for group in group_batch for t in group]
-          yield self._batch_to_train_example(
-              batch_results=all_trajectories,
-              mode=rl_engine_lib.Mode.TRAIN,
-          )
+        try:
+          for group_batch in raw_gen:
+            all_trajectories = [
+                t for group in group_batch if group for t in group
+            ]
+            if all_trajectories:
+              yield self._batch_to_train_example(
+                  batch_results=all_trajectories,
+                  mode=rl_engine_lib.Mode.TRAIN,
+              )
+        except Exception:
+          prompt_queue.put(None)
+          raise
 
       train_data_gen = _to_train_examples(train_data_gen)
     if self._packing_enabled:
@@ -898,55 +981,19 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
               self._training_config, "max_segments_per_packed_row", None
           ),
       )
-    update_steps_since_last_sync = 0
-    update_steps_per_full_batch = full_batch_size // mini_batch_size
-    unpacked_micro_step_counter = 0
-    did_eval_this_global_step = False
-    full_batch_chunks = []
-    for train_micro_batch in train_data_gen:
-      if (
-          self._training_config.max_steps
-          and self.rl_engine.global_steps >= self._training_config.max_steps
-      ):
-        logging.info(
-            "Reached max_steps: %d >= %d",
-            self.rl_engine.global_steps,
-            self._training_config.max_steps,
-        )
-        prompt_queue.put(None)
-        break
-      self._iter_steps += 1
 
-      # TODO(tsbao): Re-enable this once off-policy filtering is needed.
-      # Filter out examples that are too old (off-policy).
-      # filtered_train_micro_batch = self._filter_outdated_offpolicy_examples(
-      #     train_micro_batch
-      # )
-      # if not filtered_train_micro_batch:
-      #   continue
-      # train_micro_batch = filtered_train_micro_batch
-
-      # `train_micro_batch` is always a Sequence[TrainExample] now:
-      #  - _process_in_consumer: converted up front (GRPO -> single-element list)
-      #  - producer-side processing: TrainExamples straight from the queue
-      #  - _packing_enabled: a single packed TrainExample from pack_sequences
-      # jax.tree.map(concatenate) over a single-element list is a no-op, so this
-      # equals the old `train_examples[0]` for the GRPO consumer path.
-      merged_train_micro_batch = jax.tree.map(
-          lambda *xs: jnp.concatenate(xs, axis=0), *train_micro_batch
+    def _prepare_one_micro_batch(
+        raw_micro_batch: Sequence[TrainExample],
+    ) -> tuple[TrainExample, list[TrainExample], bool]:
+      normalized_micro_batch = self._normalize_micro_batch_metadata(
+          raw_micro_batch
       )
-
+      merged_mb = jax.tree.map(
+          lambda *xs: jnp.concatenate(xs, axis=0), *normalized_micro_batch
+      )
       if self._packing_enabled:
-        # pack-first: old/ref logp were deferred (left None) so they can be
-        # computed here on the packed buffer (segment-aware forward), sharing
-        # the same packed representation training uses.
-        merged_train_micro_batch = self._compute_packed_logps(
-            merged_train_micro_batch
-        )
-        # Packing efficiency: segment_ids==0 marks padding and dummy packs, so
-        # this is the wasted fraction. As a WeightedMetric it reduces by
-        # Sum(pad)/Sum(total), which stays correct if pack shapes ever differ.
-        seg = np.asarray(merged_train_micro_batch.segment_ids)
+        merged_mb = self._compute_packed_logps(merged_mb)
+        seg = np.asarray(merged_mb.segment_ids)
         dummy_ratio = sft_utils.WeightedMetric(
             jnp.array(float((seg == 0).sum())), jnp.array(float(seg.size))
         )
@@ -964,27 +1011,18 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
             mode=rl_engine_lib.Mode.TRAIN,
             step=self.rl_engine.global_steps,
         )
-
-      # When ``train_micro_batch_size < mini_batch_size`` we want the trainer
-      # to invoke ``train_step`` multiple times per outer iteration so the
-      # optimizer (which fires every ``gradient_accumulation_steps`` micro-
-      # steps) sees ``mini_batch_size``-shaped gradients while peak HBM is
-      # only ``train_micro_batch_size``-shaped. Slice the merged train
-      # example along its batch axis into chunks sized to one micro-step,
-      # and pass the list to ``update_actor``; ``peft_trainer.train``
-      # iterates the list and calls ``train_step`` once per chunk.
-      is_packed = (
-          hasattr(merged_train_micro_batch, "segment_ids")
-          and getattr(merged_train_micro_batch, "segment_ids") is not None
+      mb_is_packed = (
+          isinstance(merged_mb, common.TrainExample)
+          and merged_mb.segment_ids is not None
       )
-      if not is_packed:
+      if not mb_is_packed:
         assert train_micro_batch_size is not None
         seqs_per_chunk = (
             train_micro_batch_size * self.algo_config.num_generations
         )
-        n_total = merged_train_micro_batch.completion_ids.shape[0]
+        n_total = merged_mb.completion_ids.shape[0]
         if n_total > seqs_per_chunk:
-          chunked_train_micro_batch = [
+          chunked_mb = [
               jax.tree_util.tree_map(
                   lambda x: (
                       x[i : i + seqs_per_chunk]
@@ -993,211 +1031,299 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
                       and x.shape[0] == n_total
                       else x
                   ),
-                  merged_train_micro_batch,
+                  merged_mb,
               )
               for i in range(0, n_total, seqs_per_chunk)
           ]
         else:
-          chunked_train_micro_batch = [merged_train_micro_batch]
+          chunked_mb = [merged_mb]
       else:
-        chunked_train_micro_batch = [merged_train_micro_batch]
+        chunked_mb = [merged_mb]
+      return merged_mb, chunked_mb, mb_is_packed
 
-      full_batch_chunks.extend(chunked_train_micro_batch)
-
-      # --- Evaluation Logic on FIRST microbatch ---
-      current_eval_dataset = None
-      if update_steps_since_last_sync == 0:
-        current_train_step = self.rl_engine.actor_trainer.train_steps
+    update_steps_since_last_sync = 0
+    update_steps_per_full_batch = full_batch_size // mini_batch_size
+    unpacked_micro_step_counter = 0
+    did_eval_this_global_step = False
+    full_batch_chunks = []
+    pending_micro_batches = []
+    try:
+      for train_micro_batch in train_data_gen:
         if (
-            all_eval_prompts
-            and current_train_step % training_config.eval_every_n_steps == 0
-            and current_train_step != self._last_eval_train_step
+            not pending_micro_batches
+            and self._training_config.max_steps
+            and self.rl_engine.global_steps >= self._training_config.max_steps
         ):
-          self._last_eval_train_step = current_train_step
-          self._eval_iter_steps = 0
-          eval_orchestrator = self._build_orchestrator()
-
-          async def _eval_runner_async(current_eval_orchestrator):
-            eval_examples = []
-            async for batch in self._orchestrator_producer(
-                current_eval_orchestrator,
-                all_eval_prompts,
-                num_generations=self._num_generations(),
-            ):
-              eval_example = self._batch_to_train_example(
-                  batch,
-                  rl_engine_lib.Mode.EVAL,
-              )
-              eval_examples.extend(eval_example)
-            return eval_examples
-
-          eval_future = asyncio.run_coroutine_threadsafe(
-              _eval_runner_async(eval_orchestrator), self.loop
+          logging.info(
+              "Reached max_steps: %d >= %d",
+              self.rl_engine.global_steps,
+              self._training_config.max_steps,
           )
-          eval_examples = eval_future.result()
-          self._eval_iter_steps += 1
-          current_eval_dataset = eval_examples
-          did_eval_this_global_step = True
+          prompt_queue.put(None)
+          break
 
-      # --- First iteration Training Step (Parallelized with Rollout) ---
-      # Note: Suppose one full batch has m minibatches, each minibatch has n
-      # microbatches, and #iterations=K, we will:
-      #   1. Train on the m * n microbatches once as we get them from rollout.
-      #   2. When we get the full batch, repeat K-1 times on the entire batch.
-      self.rl_engine.update_actor(
-          chunked_train_micro_batch, current_eval_dataset, skip_jit
-      )
-      if hasattr(self.rl_engine, "critic_trainer"):
-        self.rl_engine.update_critic(
-            chunked_train_micro_batch, current_eval_dataset, skip_jit
+        # TODO(tsbao): Re-enable this once off-policy filtering is needed.
+        # Filter out examples that are too old (off-policy).
+        # filtered_train_micro_batch = self._filter_outdated_offpolicy_examples(
+        #     train_micro_batch
+        # )
+        # if not filtered_train_micro_batch:
+        #   continue
+        # train_micro_batch = filtered_train_micro_batch
+
+        merged_train_micro_batch, chunked_train_micro_batch, is_packed = (
+            _prepare_one_micro_batch(train_micro_batch)
         )
+        pending_micro_batches.append(chunked_train_micro_batch)
+        full_batch_chunks.extend(chunked_train_micro_batch)
 
-      # --- Weight Sync Logic ---
-      if is_packed:
-        # `merged_train_micro_batch.is_update_step` is a 0-d jax scalar set
-        # by `pack_sequences`; pull the host-side value before deciding.
-        is_update = bool(
-            np.asarray(merged_train_micro_batch.is_update_step).item()
-        )
-      else:
-        # Mirror `peft_trainer._train_step`'s derivation:
-        # `is_update_step` flips True every `grad_acc_steps` micro-batches.
-        assert grad_acc_steps is not None
-        unpacked_micro_step_counter += 1
-        is_update = unpacked_micro_step_counter % grad_acc_steps == 0
-
-      if is_update:
-        update_steps_since_last_sync += 1
-
-      if update_steps_since_last_sync == update_steps_per_full_batch:
-        # --- Remaining Iterations Training Step ---
-        iterations = self._num_iterations()
-
-        for i in range(1, iterations):
-          # TODO(b/483779605) Sub-step checkpointing.
-          self._iter_steps += len(full_batch_chunks)
-
-          # TODO(yixuanm): Eval during iteration too. Skipping for now as we
-          # will refactor the learner soon.
-          self.rl_engine.update_actor(full_batch_chunks, None, skip_jit)
-          if hasattr(self.rl_engine, "critic_trainer"):
-            self.rl_engine.update_critic(full_batch_chunks, None, skip_jit)
-        full_batch_chunks.clear()
-
-        global_step_time = time.time() - self._global_step_start_time
-        logging.info(
-            f"Global step {self.rl_engine.global_steps} completed in"
-            f" {global_step_time:.2f} seconds."
-        )
-        # One-line per-step diagnostic: raw rewards, solve rate, completion
-        # length, advantage scale, and eval (when an eval just fired this
-        # step). Mirrors the per-iter view a wandb dashboard would show
-        # without depending on the async metric logger pipeline.
-        with self._rewards_window_lock:
-          train_rewards = np.asarray(
-              self._train_rewards_window, dtype=np.float32
-          )
-          eval_rewards = np.asarray(self._eval_rewards_window, dtype=np.float32)
-          self._train_rewards_window.clear()
-          if did_eval_this_global_step:
-            self._eval_rewards_window.clear()
-        adv = np.asarray(merged_train_micro_batch.advantages, dtype=np.float32)
-        cmask = np.asarray(
-            merged_train_micro_batch.completion_mask, dtype=np.float32
-        )
-        compl_len = cmask.sum(axis=-1).mean() if cmask.size else 0.0
-        adv_abs_mean = float(np.abs(adv).mean()) if adv.size else float("nan")
-        train_r_mean = (
-            float(train_rewards.mean()) if train_rewards.size else float("nan")
-        )
-        train_solve = (
-            float((train_rewards > 0.1).mean())
-            if train_rewards.size
-            else float("nan")
-        )
-        if eval_rewards.size and did_eval_this_global_step:
-          eval_r_mean = float(eval_rewards.mean())
-          eval_solve = float((eval_rewards > 0.1).mean())
-          eval_str = (
-              f" eval_reward={eval_r_mean:.3f}"
-              f" eval_solve={eval_solve:.3f}"
-              f" eval_n={eval_rewards.size}"
+        # --- Weight Sync / Full-Batch Boundary Tracking ---
+        if is_packed:
+          # `merged_train_micro_batch.is_update_step` is a 0-d jax scalar set
+          # by `pack_sequences`; pull the host-side value before deciding.
+          is_update = bool(
+              np.asarray(merged_train_micro_batch.is_update_step).item()
           )
         else:
-          eval_str = ""
-        # Best-effort read of trainer-side per-step metrics (grad_norm,
-        # pg_loss, entropy, kl) directly from the actor trainer's metric
-        # buffer so they appear in the per-step absl log alongside the
-        # rollout metrics, independently of any external metric logger.
-        trainer_str = ""
-        try:
-          actor_trainer = self.rl_engine.actor_trainer
-          trainer_buf = getattr(
-              actor_trainer, "_prev_buffered_train_metrics", None
-          ) or getattr(actor_trainer, "_buffered_train_metrics", None)
-          if trainer_buf is not None:
-            extras = []
-            if trainer_buf.losses:
-              extras.append(f"loss={float(trainer_buf.loss):.4f}")
-            am = trainer_buf.additional_metrics
-            for key, label in (
-                ("grad_norm", "grad_norm"),
-                ("reduced_pg_loss", "reduced_pg_loss"),
-                ("entropy", "entropy"),
-                ("kl", "kl"),
-                ("log_ratio/abs_mean", "log_ratio_abs"),
-                ("pg_clipfrac", "clipfrac"),
+          # Mirror `peft_trainer._train_step`'s derivation:
+          # `is_update_step` flips True every `grad_acc_steps` micro-batches.
+          assert grad_acc_steps is not None
+          unpacked_micro_step_counter += 1
+          is_update = unpacked_micro_step_counter % grad_acc_steps == 0
+
+        if is_update:
+          update_steps_since_last_sync += 1
+
+        if update_steps_since_last_sync < update_steps_per_full_batch:
+          # Materialize all micro-batches of the current full rollout batch
+          # (including their old_per_token_logps under the pre-update actor
+          # weights) before executing any optimizer step on the actor.
+          continue
+
+        def _record_actor_substep_telemetry(
+            epoch_idx: int, mini_batch_idx: int
+        ) -> None:
+          entry: Dict[str, Any] = {
+              "global_step": int(self.rl_engine.global_steps),
+              "epoch_idx": int(epoch_idx),
+              "mini_batch_idx": int(mini_batch_idx),
+              "iter_step": int(self._iter_steps),
+          }
+          self._step_telemetry_history.append(entry)
+          self.rl_engine.buffer_metrics_async(
+              {
+                  "actor/epoch_idx": (int(epoch_idx), np.mean),
+                  "actor/mini_batch_idx": (int(mini_batch_idx), np.mean),
+              },
+              mode=rl_engine_lib.Mode.TRAIN,
+              step=self.rl_engine.global_steps,
+          )
+
+        # --- First iteration Training Step (All old_logps materialized) ---
+        for mb_idx, mb_chunks in enumerate(pending_micro_batches):
+          self._iter_steps += 1
+
+          # --- Evaluation Logic on FIRST microbatch ---
+          current_eval_dataset = None
+          if mb_idx == 0:
+            current_train_step = self.rl_engine.actor_trainer.train_steps
+            if (
+                all_eval_prompts
+                and current_train_step % training_config.eval_every_n_steps == 0
+                and current_train_step != self._last_eval_train_step
             ):
-              if key in am:
-                vals, _ = am[key]
-                if vals:
-                  v = float(
-                      np.mean(
-                          [np.asarray(common._metric_scalar(x)) for x in vals]
-                      )
+              self._last_eval_train_step = current_train_step
+              self._eval_iter_steps = 0
+              eval_orchestrator = self._build_orchestrator()
+
+              async def _eval_runner_async(current_eval_orchestrator):
+                eval_examples = []
+                eval_stream = self._wrap_group_stream(
+                    self._orchestrator_producer(
+                        current_eval_orchestrator,
+                        all_eval_prompts,
+                        num_generations=self._num_generations(),
+                    )
+                )
+                async for batch in eval_stream:
+                  eval_example = self._batch_to_train_example(
+                      batch,
+                      rl_engine_lib.Mode.EVAL,
                   )
-                  extras.append(f"{label}={v:.4f}")
-            if extras:
-              trainer_str = " " + " ".join(extras)
-        except Exception as e:  # pylint: disable=broad-except
-          logging.debug("Failed to read trainer buffered metrics: %s", e)
-        logging.info(
-            "[step %d] train_reward=%.3f train_solve=%.3f n=%d"
-            " adv_abs_mean=%.3f compl_len=%.1f time=%.1fs%s%s",
-            self.rl_engine.global_steps,
-            train_r_mean,
-            train_solve,
-            int(train_rewards.size),
-            adv_abs_mean,
-            float(compl_len),
-            global_step_time,
-            trainer_str,
-            eval_str,
-        )
-        did_eval_this_global_step = False
-        self.rl_engine.buffer_metrics_async(
-            {"perf/global_step_time": (global_step_time, np.mean)},
-            mode=rl_engine_lib.Mode.TRAIN,
-            step=self.rl_engine.global_steps,
-        )
-        if self.should_sync_weights:
-          logging.info("Requesting sync lock to sync weights...")
-          self._rollout_sync_lock.acquire_weight_sync()
-          try:
-            logging.info("Sync lock acquired. Syncing weights.")
-            with self.rl_engine.perf_v2.span(
-                perf_constants.WEIGHT_SYNC,
-                self.rl_engine.perf_v2.all_devices,
-                tags={
-                    perf_constants.STEP: self.rl_engine.global_steps,
-                },
-            ):
-              self.rl_engine.sync_weights()
-            self.policy_version += 1
-            logging.info(
-                "Weights synced. Policy version incremented to %d.",
-                self.policy_version,
+                  eval_examples.extend(eval_example)
+                return eval_examples
+
+              eval_future = asyncio.run_coroutine_threadsafe(
+                  _eval_runner_async(eval_orchestrator), self.loop
+              )
+              eval_examples = eval_future.result()
+              self._eval_iter_steps += 1
+              current_eval_dataset = eval_examples
+              did_eval_this_global_step = True
+
+          self.rl_engine.update_actor(mb_chunks, current_eval_dataset, skip_jit)
+          if hasattr(self.rl_engine, "critic_trainer"):
+            self.rl_engine.update_critic(
+                mb_chunks, current_eval_dataset, skip_jit
             )
+          _record_actor_substep_telemetry(epoch_idx=0, mini_batch_idx=mb_idx)
+        pending_micro_batches.clear()
+
+        if update_steps_since_last_sync == update_steps_per_full_batch:
+          # --- Remaining Iterations Training Step ---
+          iterations = self._num_iterations()
+
+          for i in range(1, iterations):
+            # TODO(b/483779605) Sub-step checkpointing.
+            for mb_idx, mb_chunk in enumerate(full_batch_chunks):
+              self._iter_steps += 1
+
+              # TODO(yixuanm): Eval during iteration too. Skipping for now as we
+              # will refactor the learner soon.
+              self.rl_engine.update_actor([mb_chunk], None, skip_jit)
+              if hasattr(self.rl_engine, "critic_trainer"):
+                self.rl_engine.update_critic([mb_chunk], None, skip_jit)
+              _record_actor_substep_telemetry(
+                  epoch_idx=i, mini_batch_idx=mb_idx
+              )
+          full_batch_chunks.clear()
+
+          global_step_time = time.time() - self._global_step_start_time
+          logging.info(
+              f"Global step {self.rl_engine.global_steps} completed in"
+              f" {global_step_time:.2f} seconds."
+          )
+          # One-line per-step diagnostic: raw rewards, solve rate, completion
+          # length, advantage scale, and eval (when an eval just fired this
+          # step). Mirrors the per-iter view a wandb dashboard would show
+          # without depending on the async metric logger pipeline.
+          with self._rewards_window_lock:
+            train_rewards = np.asarray(
+                self._train_rewards_window, dtype=np.float32
+            )
+            eval_rewards = np.asarray(
+                self._eval_rewards_window, dtype=np.float32
+            )
+            self._train_rewards_window.clear()
+            if did_eval_this_global_step:
+              self._eval_rewards_window.clear()
+          adv = np.asarray(
+              merged_train_micro_batch.advantages, dtype=np.float32
+          )
+          cmask = np.asarray(
+              merged_train_micro_batch.completion_mask, dtype=np.float32
+          )
+          compl_len = cmask.sum(axis=-1).mean() if cmask.size else 0.0
+          adv_abs_mean = float(np.abs(adv).mean()) if adv.size else float("nan")
+          train_r_mean = (
+              float(train_rewards.mean())
+              if train_rewards.size
+              else float("nan")
+          )
+          train_solve = (
+              float((train_rewards > 0.1).mean())
+              if train_rewards.size
+              else float("nan")
+          )
+          if eval_rewards.size and did_eval_this_global_step:
+            eval_r_mean = float(eval_rewards.mean())
+            eval_solve = float((eval_rewards > 0.1).mean())
+            eval_str = (
+                f" eval_reward={eval_r_mean:.3f}"
+                f" eval_solve={eval_solve:.3f}"
+                f" eval_n={eval_rewards.size}"
+            )
+          else:
+            eval_str = ""
+          # Best-effort read of trainer-side per-step metrics (grad_norm,
+          # pg_loss, entropy, kl) directly from the actor trainer's metric
+          # buffer so they appear in the per-step absl log alongside the
+          # rollout metrics, independently of any external metric logger.
+          trainer_str = ""
+          try:
+            actor_trainer = self.rl_engine.actor_trainer
+            trainer_buf = getattr(
+                actor_trainer, "_prev_buffered_train_metrics", None
+            ) or getattr(actor_trainer, "_buffered_train_metrics", None)
+            if trainer_buf is not None:
+              extras = []
+              if trainer_buf.losses:
+                extras.append(f"loss={float(trainer_buf.loss):.4f}")
+              am = trainer_buf.additional_metrics
+              for key, label in (
+                  ("grad_norm", "grad_norm"),
+                  ("reduced_pg_loss", "reduced_pg_loss"),
+                  ("entropy", "entropy"),
+                  ("kl", "kl"),
+                  ("log_ratio/abs_mean", "log_ratio_abs"),
+                  ("pg_clipfrac", "clipfrac"),
+              ):
+                if key in am:
+                  vals, _ = am[key]
+                  if vals:
+                    v = float(
+                        np.mean(
+                            [np.asarray(common._metric_scalar(x)) for x in vals]
+                        )
+                    )
+                    extras.append(f"{label}={v:.4f}")
+              if extras:
+                trainer_str = " " + " ".join(extras)
+          except Exception as e:  # pylint: disable=broad-except
+            logging.debug("Failed to read trainer buffered metrics: %s", e)
+          logging.info(
+              "[step %d] train_reward=%.3f train_solve=%.3f n=%d"
+              " adv_abs_mean=%.3f compl_len=%.1f time=%.1fs%s%s",
+              self.rl_engine.global_steps,
+              train_r_mean,
+              train_solve,
+              int(train_rewards.size),
+              adv_abs_mean,
+              float(compl_len),
+              global_step_time,
+              trainer_str,
+              eval_str,
+          )
+          did_eval_this_global_step = False
+          self.rl_engine.buffer_metrics_async(
+              {"perf/global_step_time": (global_step_time, np.mean)},
+              mode=rl_engine_lib.Mode.TRAIN,
+              step=self.rl_engine.global_steps,
+          )
+          if self.should_sync_weights:
+            logging.info("Requesting sync lock to sync weights...")
+            self._rollout_sync_lock.acquire_weight_sync()
+            try:
+              logging.info("Sync lock acquired. Syncing weights.")
+              with self.rl_engine.perf_v2.span(
+                  perf_constants.WEIGHT_SYNC,
+                  self.rl_engine.perf_v2.all_devices,
+                  tags={
+                      perf_constants.STEP: self.rl_engine.global_steps,
+                  },
+              ):
+                self.rl_engine.sync_weights()
+              self.policy_version += 1
+              logging.info(
+                  "Weights synced. Policy version incremented to %d.",
+                  self.policy_version,
+              )
+              try:
+                with self.rl_engine.perf_v2.span(
+                    perf_constants.DATA_LOADING,
+                    tags={
+                        perf_constants.STEP: self.rl_engine.global_steps,
+                    },
+                ):
+                  batch = next(full_dataset_iterator)
+                self._put_prompts_to_queue(prompt_queue, batch)
+              except StopIteration:
+                prompt_queue.put(None)
+            finally:
+              self._rollout_sync_lock.release_weight_sync()
+              logging.info("Sync lock released.")
+          else:
+            self.rl_engine.global_steps += 1
             try:
               with self.rl_engine.perf_v2.span(
                   perf_constants.DATA_LOADING,
@@ -1209,33 +1335,19 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
               self._put_prompts_to_queue(prompt_queue, batch)
             except StopIteration:
               prompt_queue.put(None)
-          finally:
-            self._rollout_sync_lock.release_weight_sync()
-            logging.info("Sync lock released.")
-        else:
-          self.rl_engine.global_steps += 1
-          try:
-            with self.rl_engine.perf_v2.span(
-                perf_constants.DATA_LOADING,
-                tags={
-                    perf_constants.STEP: self.rl_engine.global_steps,
-                },
-            ):
-              batch = next(full_dataset_iterator)
-            self._put_prompts_to_queue(prompt_queue, batch)
-          except StopIteration:
-            prompt_queue.put(None)
 
-        self.rl_engine.buffer_metrics(
-            self.rl_engine.perf_v2.export(),
-            mode=rl_engine_lib.Mode.TRAIN,
-        )
-        update_steps_since_last_sync = 0
-        did_eval_this_global_step = False
-        self._global_step_start_time = time.time()
+          self.rl_engine.buffer_metrics(
+              self.rl_engine.perf_v2.export(),
+              mode=rl_engine_lib.Mode.TRAIN,
+          )
+          update_steps_since_last_sync = 0
+          did_eval_this_global_step = False
+          self._global_step_start_time = time.time()
 
-    _ = producer_future.result()
-    self.rl_engine.close()
+      _ = producer_future.result()
+    finally:
+      prompt_queue.put(None)
+      self.rl_engine.close()
 
   def _put_prompts_to_queue(
       self,

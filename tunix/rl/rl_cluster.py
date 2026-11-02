@@ -1210,40 +1210,8 @@ class RLEngine:
           " first."
       )
     micro_batch_size = micro_batch_size or batch_size
+    data_sharding_axis = self.cluster_config.training_config.data_sharding_axis
     with self._get_mesh_and_logical_axis_rules_cm(Role.ACTOR) as (mesh, _):
-      dest_prompt_tokens = sharding_utils.shard_input(
-          prompt_tokens,
-          self.cluster_config.training_config.data_sharding_axis,
-      )
-      dest_completion_tokens = sharding_utils.shard_input(
-          completion_tokens,
-          self.cluster_config.training_config.data_sharding_axis,
-      )
-      dest_segment_ids = (
-          None
-          if segment_ids is None
-          else sharding_utils.shard_input(
-              segment_ids,
-              self.cluster_config.training_config.data_sharding_axis,
-          )
-      )
-      dest_segment_positions = (
-          None
-          if segment_positions is None
-          else sharding_utils.shard_input(
-              segment_positions,
-              self.cluster_config.training_config.data_sharding_axis,
-          )
-      )
-
-      dest_token_mask = (
-          None
-          if token_mask is None
-          else sharding_utils.shard_input(
-              token_mask, self.cluster_config.training_config.data_sharding_axis
-          )
-      )
-
       # Use the anchor (start-of-global-step) actor weights so old_per_token_logps
       # reference the same policy vllm sampled with even when mini_batch_size <
       # full_batch_size or num_iterations > 1. Only offload the live actor when
@@ -1267,32 +1235,47 @@ class RLEngine:
       for batch_slice in rl_utils.chunk_slices_by_size(
           stop=batch_size, step=micro_batch_size
       ):
+        mb_prompt_tokens = sharding_utils.shard_input(
+            prompt_tokens[batch_slice], data_sharding_axis
+        )
+        mb_completion_tokens = sharding_utils.shard_input(
+            completion_tokens[batch_slice], data_sharding_axis
+        )
+        mb_segment_ids = (
+            None
+            if segment_ids is None
+            else sharding_utils.shard_input(
+                segment_ids[batch_slice], data_sharding_axis
+            )
+        )
+        mb_segment_positions = (
+            None
+            if segment_positions is None
+            else sharding_utils.shard_input(
+                segment_positions[batch_slice], data_sharding_axis
+            )
+        )
+        mb_token_mask = (
+            None
+            if token_mask is None
+            else sharding_utils.shard_input(
+                token_mask[batch_slice], data_sharding_axis
+            )
+        )
         outs.append(
             common.compute_per_token_logps(
                 graphdef,
                 anchor_policy_state,
-                prompt_tokens=dest_prompt_tokens[batch_slice],
-                completion_tokens=dest_completion_tokens[batch_slice],
+                prompt_tokens=mb_prompt_tokens,
+                completion_tokens=mb_completion_tokens,
                 pad_id=pad_id,
                 eos_id=eos_id,
                 stop_gradient=True,
                 temperature=temperature,
                 chunk_size=self.cluster_config.training_config.compute_logps_chunk_size,
-                segment_ids=(
-                    None
-                    if dest_segment_ids is None
-                    else dest_segment_ids[batch_slice]
-                ),
-                segment_positions=(
-                    None
-                    if dest_segment_positions is None
-                    else dest_segment_positions[batch_slice]
-                ),
-                token_mask=(
-                    None
-                    if dest_token_mask is None
-                    else dest_token_mask[batch_slice]
-                ),
+                segment_ids=mb_segment_ids,
+                segment_positions=mb_segment_positions,
+                token_mask=mb_token_mask,
             )
         )
       actor_per_token_logps = jnp.concatenate(outs, axis=0)
@@ -1314,7 +1297,7 @@ class RLEngine:
     Args:
       increment_global_steps: Whether this sync ends a global step.
     """
-    if jax.devices() and jax.default_backend() not in ["tpu", "gpu"]:
+    if jax.devices() and jax.default_backend() not in ["tpu", "gpu", "cpu"]:
       cm = contextlib.ExitStack()
       cm.enter_context(jax.transfer_guard_device_to_host("disallow_explicit"))
       cm.enter_context(jax.transfer_guard_host_to_device("disallow_explicit"))

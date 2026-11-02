@@ -66,8 +66,10 @@ class DrGRPOlearnerTest(parameterized.TestCase):
     example.old_per_token_logps = self.old_per_token_logps
     example.segment_ids = None
     example.segment_positions = None
+    example.num_segments = None
     example.sampler_is_weights = None
     example.routed_experts = None
+    example.token_mask = None
     return example
 
   def test_create_config(self):

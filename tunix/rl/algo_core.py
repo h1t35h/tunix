@@ -395,19 +395,336 @@ def ppo_value_loss_fn(
   return sft_utils.LossOutput(primary_loss=primary_loss, aux_metrics=aux)
 
 
-# ==============================================================================
-# GRPO Core
-# ==============================================================================
+def compute_gspo_importance_ratio(
+    safe_per_token_logps: jax.Array,
+    safe_old_per_token_logps: jax.Array,
+    completion_mask: jax.Array,
+    *,
+    loss_algo: str = "grpo",
+    gspo_pool_mode: str = "sequence",
+    pool_mode: str | None = None,
+    turn_ids: jax.Array | None = None,
+    num_turn_segments: int | None = None,
+    token_flags: jax.Array | None = None,
+    segment_ids: jax.Array | None = None,
+    num_segments: int | None = None,
+) -> tuple[jax.Array, jax.Array]:
+  """Computes importance ratio and log ratio, applying GSPO pooling if configured.
+
+  When `loss_algo` is `'gspo-token'` or `'gspo-turn'`, sequence-, turn-, span-,
+  or sub-turn span-level (`'turn_span'`) geometric mean log-ratios are pooled
+  and substituted into the ratio value using the stop-gradient trick to preserve
+  per-token policy gradients:
+    `ratio = exp(clip(logp - stop_grad(logp) + stop_grad(pooled_mean)))`.
+  Otherwise, returns standard per-token `(exp(clip(diff)), clip(diff))`.
+
+  Args:
+    safe_per_token_logps: Current policy per-token log-probabilities `[B, T]`.
+    safe_old_per_token_logps: Rollout policy per-token log-probabilities `[B, T]`.
+    completion_mask: Mask of active assistant tokens `[B, T]`.
+    loss_algo: Algorithm name (`'grpo'`, `'gspo-token'`, or `'gspo-turn'`).
+    gspo_pool_mode: Pooling granularity (`'sequence'`, `'turn'`, `'span'`, or
+      `'turn_span'`).
+    pool_mode: Optional alias for `gspo_pool_mode`.
+    turn_ids: Optional assistant turn index array `[B, T]`.
+    num_turn_segments: Optional static max count of turn segments.
+    token_flags: Optional binary fault flag array `[B, T]`.
+    segment_ids: Optional packed sequence segment index array `[B, T]`.
+    num_segments: Optional static max count of packed segments.
+
+  Returns:
+    Tuple `(is_ratio, seq_importance_ratio)` where `is_ratio` is `[B, T]` and
+    `seq_importance_ratio` is the log ratio `[B, T]`.
+  """
+  if pool_mode is not None:
+    gspo_pool_mode = pool_mode
+  log_diff = safe_per_token_logps - safe_old_per_token_logps
+  seq_importance_ratio = jnp.clip(log_diff, max=20.0, min=-20.0)
+
+  if loss_algo in ("gspo-token", "gspo-turn"):
+    effective_pool_mode = gspo_pool_mode
+    if loss_algo == "gspo-turn" and effective_pool_mode == "sequence":
+      effective_pool_mode = "turn"
+
+    if effective_pool_mode == "turn_span":
+      if turn_ids is not None and token_flags is not None:
+        pool_seg_ids = jnp.where(
+            (completion_mask > 0) & (turn_ids > 0),
+            turn_ids.astype(jnp.int32) * 2
+            + (token_flags > 0).astype(jnp.int32),
+            0,
+        )
+        base_num_segs = int(num_turn_segments or num_segments or 8)
+        pool_num_segs = base_num_segs * 2 + 2
+      elif turn_ids is not None:
+        pool_seg_ids = turn_ids
+        pool_num_segs = num_turn_segments or num_segments or 8
+      elif token_flags is not None:
+        pool_seg_ids = jnp.where(
+            completion_mask > 0,
+            1 + (token_flags > 0).astype(jnp.int32),
+            0,
+        )
+        pool_num_segs = 4
+      elif segment_ids is not None:
+        pool_seg_ids = segment_ids
+        pool_num_segs = num_segments or num_turn_segments or 8
+      else:
+        pool_seg_ids = None
+        pool_num_segs = None
+    elif effective_pool_mode == "span":
+      if token_flags is not None:
+        if segment_ids is not None:
+          pool_seg_ids = jnp.where(
+              (completion_mask > 0) & (segment_ids > 0),
+              segment_ids.astype(jnp.int32) * 2
+              + (token_flags > 0).astype(jnp.int32),
+              0,
+          )
+          base_num_segs = int(num_segments or num_turn_segments or 8)
+          pool_num_segs = base_num_segs * 2 + 2
+        else:
+          pool_seg_ids = jnp.where(
+              completion_mask > 0,
+              1 + (token_flags > 0).astype(jnp.int32),
+              0,
+          )
+          pool_num_segs = 4
+      elif segment_ids is not None:
+        pool_seg_ids = segment_ids
+        pool_num_segs = num_segments or num_turn_segments or 8
+      else:
+        pool_seg_ids = None
+        pool_num_segs = None
+    elif effective_pool_mode == "turn" and turn_ids is not None:
+      pool_seg_ids = turn_ids
+      pool_num_segs = num_turn_segments or num_segments or 8
+    elif segment_ids is not None:
+      pool_seg_ids = segment_ids
+      pool_num_segs = num_segments or num_turn_segments or 8
+    else:
+      pool_seg_ids = None
+      pool_num_segs = None
+
+    if pool_seg_ids is not None and pool_num_segs is not None:
+      if isinstance(pool_seg_ids, np.ndarray):
+        pool_num_segs = max(int(pool_num_segs), int(np.max(pool_seg_ids)) + 1)
+      elif not isinstance(pool_seg_ids, jax.core.Tracer):
+        max_seg = jnp.max(pool_seg_ids)
+        if not isinstance(max_seg, jax.core.Tracer):
+          pool_num_segs = max(int(pool_num_segs), int(max_seg) + 1)
+
+    if pool_seg_ids is None:
+      seq_mean_ratio = jnp.sum(seq_importance_ratio, axis=-1) / jnp.clip(
+          completion_mask.sum(-1), min=1
+      )
+      seq_mean_ratio = jnp.expand_dims(seq_mean_ratio, axis=-1)
+    else:
+      valid_seg_mask = completion_mask * (pool_seg_ids > 0).astype(
+          completion_mask.dtype
+      )
+      per_seg_sum = common.segmented_sum(
+          jnp.where(valid_seg_mask > 0, seq_importance_ratio, 0.0),
+          pool_seg_ids,
+          pool_num_segs,  # pyrefly: ignore[bad-argument-type]
+      )
+      per_seg_count = common.segmented_count(
+          pool_seg_ids,
+          pool_num_segs,  # pyrefly: ignore[bad-argument-type]
+          mask=valid_seg_mask,
+      )
+      per_seg_mean = per_seg_sum / jnp.clip(per_seg_count, min=1.0)
+      seq_mean_ratio = jnp.take_along_axis(
+          per_seg_mean, pool_seg_ids.astype(jnp.int32), axis=1
+      )
+      seq_mean_ratio = jnp.where(valid_seg_mask > 0, seq_mean_ratio, 0.0)
+
+    seq_importance_ratio = (
+        safe_per_token_logps
+        - jax.lax.stop_gradient(safe_per_token_logps)
+        + jax.lax.stop_gradient(seq_mean_ratio)
+    )
+    seq_importance_ratio = jnp.clip(seq_importance_ratio, min=-10.0, max=10.0)
+
+  is_ratio = jnp.exp(seq_importance_ratio)
+  return is_ratio, seq_importance_ratio
+
+
+def compute_policy_loss_and_clipping(
+    adv: jax.Array,
+    is_ratio: jax.Array,
+    active_mask: jax.Array,
+    *,
+    clip_mode: str = "ppo",
+    epsilon: float = 0.2,
+    epsilon_high: float = 0.2,
+    epsilon_neg: float | None = None,
+    epsilon_neg_high: float | None = None,
+    epsilon_c: float | None = None,
+    completion_mask: jax.Array | None = None,
+    loss_aggregation_mode: str = "token-mean",
+    segment_ids: jax.Array | None = None,
+    num_segments: int | None = None,
+    gspo_length_adaptive_clipping: bool = False,
+    gspo_ref_length: int = 1024,
+    gspo_clip_min: float = 0.001,
+    gspo_clip_max: float = 0.05,
+    turn_ids: jax.Array | None = None,
+    num_turn_segments: int | None = None,
+    gspo_pool_mode: str = "sequence",
+) -> tuple[
+    jax.Array, jax.Array, jax.Array, jax.Array, sft_utils.WeightedMetric
+]:
+  """Computes policy loss, individual branch losses, and clipping metrics.
+
+  Supports both PPO dual clipping and sign-decoupled hard mask clipping
+  (`clip_mode="mask"`), with optional length-adaptive trust-region scaling.
+
+  Args:
+    adv: Advantage array `[B, T]`.
+    is_ratio: Importance ratio array `[B, T]`.
+    active_mask: Boolean active token mask `[B, T]`.
+    clip_mode: Clipping mechanism (`'ppo'` or `'mask'`).
+    epsilon: Positive advantage lower clip bound `1 - eps`.
+    epsilon_high: Positive advantage upper clip bound `1 + eps_high`.
+    epsilon_neg: Negative advantage lower clip bound `1 - eps_neg`.
+    epsilon_neg_high: Negative advantage upper clip bound `1 + eps_neg_high`.
+    epsilon_c: Dual-clip PPO lower bound parameter.
+    completion_mask: Mask of active assistant tokens `[B, T]`.
+    loss_aggregation_mode: Aggregation mode for loss metrics.
+    segment_ids: Optional sequence segment IDs.
+    num_segments: Optional sequence segment count.
+    gspo_length_adaptive_clipping: Whether to scale epsilon by
+      `sqrt(gspo_ref_length / L)`.
+    gspo_ref_length: Reference length `L_ref` for length-adaptive clipping.
+    gspo_clip_min: Minimum bound for length-scaled epsilon.
+    gspo_clip_max: Maximum bound for length-scaled epsilon.
+    turn_ids: Optional turn IDs `[B, T]` for turn-level length scaling.
+    num_turn_segments: Optional static max count of turn segments.
+    gspo_pool_mode: GSPO pooling granularity.
+
+  Returns:
+    Tuple `(per_token_loss, pg_loss_1, pg_loss_2, unreduced_clip_frac, pg_clipfrac_lower)`.
+  """
+  raw_eps_neg = epsilon_neg if epsilon_neg is not None else epsilon
+  raw_eps_neg_high = (
+      epsilon_neg_high if epsilon_neg_high is not None else epsilon_high
+  )
+  if gspo_length_adaptive_clipping:
+    mask_for_len = (
+        completion_mask
+        if completion_mask is not None
+        else active_mask.astype(jnp.float32)
+    )
+    if turn_ids is not None and "turn" in gspo_pool_mode:
+      t_num_segs = int(num_turn_segments or num_segments or 8)
+      if isinstance(turn_ids, np.ndarray):
+        t_num_segs = max(t_num_segs, int(np.max(turn_ids)) + 1)
+      elif not isinstance(turn_ids, jax.core.Tracer):
+        max_t = jnp.max(turn_ids)
+        if not isinstance(max_t, jax.core.Tracer):
+          t_num_segs = max(t_num_segs, int(max_t) + 1)
+      valid_t_mask = ((mask_for_len > 0) & (turn_ids > 0)).astype(jnp.float32)
+      per_turn_counts = common.segmented_count(
+          turn_ids, t_num_segs, mask=valid_t_mask
+      )
+      eff_len = jnp.take_along_axis(
+          per_turn_counts, turn_ids.astype(jnp.int32), axis=1
+      )
+    elif segment_ids is not None and num_segments is not None:
+      per_seg_counts = common.segmented_count(
+          segment_ids,
+          num_segments,
+          mask=(mask_for_len > 0).astype(jnp.float32),
+      )
+      eff_len = jnp.take_along_axis(
+          per_seg_counts, segment_ids.astype(jnp.int32), axis=1
+      )
+    else:
+      eff_len = jnp.sum(
+          (mask_for_len > 0).astype(jnp.float32), axis=-1, keepdims=True
+      )
+    len_scale = jnp.sqrt(
+        jnp.float32(gspo_ref_length) / jnp.maximum(eff_len, 1.0)
+    )
+    eff_eps = jnp.clip(epsilon * len_scale, gspo_clip_min, gspo_clip_max)
+    eff_eps_high = jnp.clip(
+        epsilon_high * len_scale, gspo_clip_min, gspo_clip_max
+    )
+    eff_eps_neg = jnp.clip(
+        raw_eps_neg * len_scale, gspo_clip_min, gspo_clip_max
+    )
+    eff_eps_neg_high = jnp.clip(
+        raw_eps_neg_high * len_scale, gspo_clip_min, gspo_clip_max
+    )
+  else:
+    eff_eps = epsilon
+    eff_eps_high = epsilon_high
+    eff_eps_neg = raw_eps_neg
+    eff_eps_neg_high = raw_eps_neg_high
+
+  if clip_mode == "mask":
+    lo = jnp.where(adv >= 0.0, 1.0 - eff_eps, 1.0 - eff_eps_neg)
+    hi = jnp.where(adv >= 0.0, 1.0 + eff_eps_high, 1.0 + eff_eps_neg_high)
+    keep = jax.lax.stop_gradient(
+        ((is_ratio >= lo) & (is_ratio <= hi)).astype(jnp.float32)
+    )
+    per_token_loss = jnp.where(active_mask, -adv * is_ratio * keep, 0.0).astype(
+        jnp.float32
+    )
+    pg_loss_1 = -adv * is_ratio
+    pg_loss_2 = per_token_loss
+    unreduced_clip_frac = jnp.sum(jnp.where(active_mask, 1.0 - keep, 0.0))
+    pg_clipfrac_lower = sft_utils.WeightedMetric(
+        jnp.array(0.0, dtype=jnp.float32), jnp.array(1.0, dtype=jnp.float32)
+    )
+  else:
+    pg_loss_1 = -adv * is_ratio
+    pg_loss_2 = -adv * jnp.clip(is_ratio, 1.0 - eff_eps, 1.0 + eff_eps_high)
+
+    per_token_loss = jnp.maximum(pg_loss_1, pg_loss_2).astype(jnp.float32)
+
+    unreduced_clip_frac = jnp.sum(
+        jnp.greater(pg_loss_2, pg_loss_1).astype(jnp.float32)
+    )
+
+    if epsilon_c is not None:
+      pg_loss_3 = -epsilon_c * adv
+    else:
+      pg_loss_3 = per_token_loss
+
+    per_token_pg_clipfrac_lower = (
+        (per_token_loss > pg_loss_3) & (adv < 0.0)
+    ).astype(jnp.float32)
+    pg_clipfrac_lower = common.aggregate_loss(
+        per_token_pg_clipfrac_lower,
+        completion_mask,
+        loss_aggregation_mode,
+        segment_ids=segment_ids,
+        num_segments=num_segments,
+    )
+
+    pg_loss_clipped_dual = jnp.minimum(pg_loss_3, per_token_loss)
+    per_token_loss = jnp.where(adv < 0.0, pg_loss_clipped_dual, per_token_loss)
+
+  return (
+      per_token_loss,
+      pg_loss_1,
+      pg_loss_2,
+      unreduced_clip_frac,
+      pg_clipfrac_lower,
+  )
 
 
 @function_registry.register_policy_loss_fn("grpo")
 def grpo_loss_fn(
-    model,
-    train_example,
-    algo_config,
-    pad_id,
-    eos_id,
-    **kwargs,
+    model: nnx.Module,
+    train_example: common.TrainExample,
+    algo_config: algorithm_config.GRPOConfig,
+    pad_id: int,
+    eos_id: int,
+    *,
+    compute_logps_chunk_size: int = 0,
 ) -> sft_utils.LossOutput:
   """GRPO loss function.
 
@@ -422,7 +739,8 @@ def grpo_loss_fn(
       per-token log probabilities from the reference and policy models.
     algo_config: The algorithm config.
     pad_id: The pad ID from tokenizer.
-    eos_id: The eos ID from.
+    eos_id: The eos ID from tokenizer.
+    compute_logps_chunk_size: Optional chunk size for log-prob computation.
 
   Returns:
     A LossOutput containing the loss and an aux dictionary.
@@ -430,7 +748,12 @@ def grpo_loss_fn(
   beta = algo_config.beta
   epsilon = algo_config.epsilon
   loss_algo = algo_config.loss_algo
-  epsilon_high = algo_config.epsilon_high
+  clip_mode = algo_config.clip_mode
+  epsilon_high = (
+      algo_config.epsilon_high
+      if algo_config.epsilon_high is not None
+      else epsilon
+  )
   epsilon_c = algo_config.epsilon_c
   loss_aggregation_mode = algo_config.loss_agg_mode
 
@@ -442,19 +765,37 @@ def grpo_loss_fn(
   # row; `num_segments` is the static segment-bucket count. Both are None when
   # not packing, in which case every aggregate_loss/reduced_loss_agg below (and
   # the gspo-token pooling) takes its per-row branch unchanged.
-  segment_ids = getattr(train_example, "segment_ids", None)
-  num_segments = getattr(train_example, "num_segments", None)
+  raw_segment_ids = train_example.segment_ids
+  raw_num_segments = train_example.num_segments
+  segment_positions = train_example.segment_positions
+  is_packed = (raw_segment_ids is not None) and (segment_positions is not None)
+  segment_ids = raw_segment_ids if is_packed else None
+  num_segments = raw_num_segments if is_packed else None
+  if isinstance(train_example, common.TrainExample):
+    turn_ids = train_example.turn_ids
+    num_turn_segments = train_example.num_turn_segments
+    token_flags = train_example.token_flags
+    token_mask = train_example.token_mask
+    completion_attention_mask = train_example.completion_attention_mask
+  else:
+    turn_ids = None
+    num_turn_segments = None
+    token_flags = None
+    token_mask = None
+    completion_attention_mask = None
 
   # TODO(tsbao): split can be avoided with updated peft_trainer model handling.
   graphdef, state = nnx.split(model)
-  completion_attention_mask = getattr(
-      train_example, "completion_attention_mask", None
-  )
-  token_mask = None
-  if isinstance(completion_attention_mask, (jax.Array, np.ndarray)):
-    token_mask = jnp.concatenate(
-        [train_example.prompt_mask, completion_attention_mask], axis=1
-    )
+  if not isinstance(token_mask, (jax.Array, np.ndarray)):
+    token_mask = None
+  if token_mask is None and not is_packed:
+    if (
+        isinstance(completion_attention_mask, (jax.Array, np.ndarray))
+        and train_example.prompt_mask is not None
+    ):
+      token_mask = jnp.concatenate(
+          [train_example.prompt_mask, completion_attention_mask], axis=1
+      )
   per_token_logps, token_entropy = common.compute_per_token_logps(
       graphdef,
       state,
@@ -465,10 +806,10 @@ def grpo_loss_fn(
       stop_gradient=False,
       return_entropy=True,
       segment_ids=segment_ids,
-      segment_positions=getattr(train_example, "segment_positions", None),
+      segment_positions=segment_positions if is_packed else None,
       temperature=algo_config.temperature,
-      chunk_size=kwargs.get("compute_logps_chunk_size", 0),
-      routed_experts=getattr(train_example, "routed_experts", None),
+      chunk_size=compute_logps_chunk_size,
+      routed_experts=train_example.routed_experts,
       token_mask=token_mask,
   )
   per_token_logps = jnp.astype(per_token_logps, jnp.float32)
@@ -542,43 +883,19 @@ def grpo_loss_fn(
   token_denom = jnp.sum(completion_mask)
   unreduced_ppo_kl = jnp.sum(-seq_importance_ratio)
 
-  seq_importance_ratio = jnp.clip(seq_importance_ratio, max=20.0, min=-20.0)
-
-  # TODO(sizhi): Refactor this to a separate function.
-  if loss_algo == "gspo-token":
-    if segment_ids is None:
-      # Per-row mean log-ratio: each row is exactly one sequence.
-      seq_mean_ratio = jnp.sum(seq_importance_ratio, axis=-1) / jnp.clip(
-          completion_mask.sum(-1), min=1
-      )
-      seq_mean_ratio = jnp.expand_dims(seq_mean_ratio, axis=-1)
-    else:
-      # Per-SEGMENT mean log-ratio: a packed row holds K sequences, so pooling
-      # per row would mix them into one biased ratio. Pool per segment, then
-      # scatter each token its own segment's mean via take_along_axis. Padding
-      # (segment 0, mask 0) yields 0 and is masked out downstream.
-      per_seg_sum = common.segmented_sum(
-          seq_importance_ratio,
-          segment_ids,
-          num_segments,  # pyrefly: ignore[bad-argument-type]
-      )
-      per_seg_count = common.segmented_count(
-          segment_ids, num_segments, mask=completion_mask  # pyrefly: ignore[bad-argument-type]
-      )
-      per_seg_mean = per_seg_sum / jnp.clip(per_seg_count, min=1.0)
-      seq_mean_ratio = jnp.take_along_axis(
-          per_seg_mean, segment_ids.astype(jnp.int32), axis=1
-      )
-    # Sequence-level VALUE, per-token GRADIENT (stop-gradient trick): the
-    # `x - stop_grad(x)` term is 0 in value but carries d/dtheta per token.
-    seq_importance_ratio = (
-        safe_per_token_logps
-        - jax.lax.stop_gradient(safe_per_token_logps)
-        + jax.lax.stop_gradient(seq_mean_ratio)
-    )
-    seq_importance_ratio = jnp.clip(seq_importance_ratio, min=-10.0, max=10.0)
-
-  is_ratio = jnp.exp(seq_importance_ratio)
+  gspo_pool_mode = algo_config.gspo_pool_mode
+  is_ratio, seq_importance_ratio = compute_gspo_importance_ratio(
+      safe_per_token_logps,
+      safe_old_per_token_logps,
+      completion_mask,
+      loss_algo=loss_algo,
+      gspo_pool_mode=gspo_pool_mode,
+      turn_ids=turn_ids,
+      num_turn_segments=num_turn_segments,
+      token_flags=token_flags,
+      segment_ids=raw_segment_ids,
+      num_segments=raw_num_segments,
+  )
 
   # Advantages must be broadcast against seq_length.
   # When sequence packing is used, advantages are already 2D [B, seq_length].
@@ -588,37 +905,34 @@ def grpo_loss_fn(
   )
   adv = jnp.where(active_mask & jnp.isfinite(raw_adv), raw_adv, 0.0)
 
-  pg_loss_1 = -adv * is_ratio
-  pg_loss_2 = -adv * jnp.clip(is_ratio, 1 - epsilon, 1 + epsilon_high)
-
-  per_token_loss = jnp.maximum(pg_loss_1, pg_loss_2).astype(jnp.float32)
-
-  unreduced_clip_frac = jnp.sum(
-      jnp.greater(pg_loss_2, pg_loss_1).astype(jnp.float32)
-  )
-
-  # dual-clip ppo loss
-  if epsilon_c is not None:
-    pg_loss_3 = -epsilon_c * adv
-  else:
-    pg_loss_3 = per_token_loss
-
-  # pg_clipfrac_lower measures how often dual-clip ppo kicks in.
-  # It kicks in when the standard clipped loss is larger than pg_loss_3
-  # for instances with negative advantages.
-  per_token_pg_clipfrac_lower = (
-      (per_token_loss > pg_loss_3) & (adv < 0.0)
-  ).astype(jnp.float32)
-  pg_clipfrac_lower = common.aggregate_loss(
-      per_token_pg_clipfrac_lower,
-      completion_mask,
-      loss_aggregation_mode,
+  (
+      per_token_loss,
+      pg_loss_1,
+      pg_loss_2,
+      unreduced_clip_frac,
+      pg_clipfrac_lower,
+  ) = compute_policy_loss_and_clipping(
+      adv,
+      is_ratio,
+      active_mask,
+      clip_mode=clip_mode,
+      epsilon=epsilon,
+      epsilon_high=epsilon_high,
+      epsilon_neg=algo_config.epsilon_neg,
+      epsilon_neg_high=algo_config.epsilon_neg_high,
+      epsilon_c=epsilon_c,
+      completion_mask=completion_mask,
+      loss_aggregation_mode=loss_aggregation_mode,
       segment_ids=segment_ids,
       num_segments=num_segments,
+      gspo_length_adaptive_clipping=algo_config.gspo_length_adaptive_clipping,
+      gspo_ref_length=algo_config.gspo_ref_length,
+      gspo_clip_min=algo_config.gspo_clip_min,
+      gspo_clip_max=algo_config.gspo_clip_max,
+      turn_ids=turn_ids,
+      num_turn_segments=num_turn_segments,
+      gspo_pool_mode=gspo_pool_mode,
   )
-
-  pg_loss_clipped_dual = jnp.minimum(pg_loss_3, per_token_loss)
-  per_token_loss = jnp.where(adv < 0.0, pg_loss_clipped_dual, per_token_loss)
 
   # Optional truncated importance-sampling (TIS) and/or rejection-sampling (RS)
   # correction for the residual sampler-vs-trainer log-probability mismatch.
@@ -642,6 +956,7 @@ def grpo_loss_fn(
       loss_aggregation_mode,
       segment_ids=segment_ids,
       num_segments=num_segments,
+      min_seq_len_norm=algo_config.min_seq_len_norm,
   )
   reduced_pg_loss = common.reduced_loss_agg(
       per_token_loss,
@@ -649,6 +964,7 @@ def grpo_loss_fn(
       loss_aggregation_mode,
       segment_ids=segment_ids,
       num_segments=num_segments,
+      min_seq_len_norm=algo_config.min_seq_len_norm,
   )
   total_loss = (
       unreduced_pg_loss  # KL added below when beta != 0; feeds gradient
@@ -662,7 +978,14 @@ def grpo_loss_fn(
       jnp.min(jnp.where(active_mask, is_ratio, jnp.inf)),
       0.0,
   )
+  log_ratio_mean = masked_mean(seq_importance_ratio, active_mask)
   log_ratio_abs_mean = masked_mean(jnp.abs(seq_importance_ratio), active_mask)
+  seq_clipfrac = masked_mean(
+      ((is_ratio < 1.0 - epsilon) | (is_ratio > 1.0 + epsilon_high)).astype(
+          jnp.float32
+      ),
+      active_mask,
+  )
   pg_loss_1_mean = masked_mean(pg_loss_1, active_mask)
   pg_loss_2_mean = masked_mean(pg_loss_2, active_mask)
   adv_abs_mean = masked_mean(jnp.abs(adv), active_mask)
@@ -689,6 +1012,7 @@ def grpo_loss_fn(
       "pg_clipfrac": sft_utils.WeightedMetric(
           unreduced_clip_frac, token_denom, min_denom=1.0
       ),
+      "seq_clipfrac": seq_clipfrac,
       "ppo_kl": sft_utils.WeightedMetric(
           unreduced_ppo_kl, token_denom, min_denom=1.0
       ),
@@ -696,7 +1020,10 @@ def grpo_loss_fn(
       "is_ratio/mean": is_ratio_mean,
       "is_ratio/max": is_ratio_max,
       "is_ratio/min": is_ratio_min,
+      "log_ratio/mean": log_ratio_mean,
+      "log_ratio_mean": log_ratio_mean,
       "log_ratio/abs_mean": log_ratio_abs_mean,
+      "log_ratio_abs_mean": log_ratio_abs_mean,
       "pg_loss/unclipped_mean": pg_loss_1_mean,
       "pg_loss/clipped_mean": pg_loss_2_mean,
       "advantage/abs_mean": adv_abs_mean,
@@ -850,3 +1177,7 @@ def build_critic_model_input_fn(
       pad_id=pad_id,
       eos_id=eos_id,
   )
+
+
+# Register 'mimo' advantage estimator from advantage_shaping module.
+from tunix.rl import advantage_shaping  # pylint: disable=unused-import,g-import-not-at-top

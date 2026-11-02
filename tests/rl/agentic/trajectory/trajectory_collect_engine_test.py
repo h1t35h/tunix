@@ -47,6 +47,7 @@ class TrajectoryCollectEngineTest(absltest.TestCase):
         base_agent.ConversationAgentBase, instance=True
     )
     self.mock_env = mock.create_autospec(self._TestEnv, instance=True)
+    self.mock_env.export_trajectory_extras.return_value = {}
 
     self.mock_env.max_steps = 10
 
@@ -2496,6 +2497,11 @@ class ExactTokenContinuityCollectTest(absltest.TestCase):
     # Total routed_experts length must be 3 + 11 = 14.
     self.assertEqual(result['routed_experts'].shape, (14, 2, 2))
     np.testing.assert_array_equal(result['routed_experts'][:3], init_routed[:3])
+    self.assertEqual(result['assistant_turn_token_spans'], [(0, 2), (7, 9)])
+    np.testing.assert_array_equal(
+        result['conversation_token_flags'], np.zeros(11, dtype=np.int8)
+    )
+    self.assertEqual(result['env_extras'], {})
 
 
 if __name__ == '__main__':

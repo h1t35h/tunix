@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import functools
-import os
+import importlib.util
 import os
 import unittest
 from unittest import mock
@@ -28,7 +28,6 @@ from jax import numpy as jnp
 import numpy as np
 import optax
 from transformers import tokenization_utils_base
-from tunix.dist_rl.orchestrator import rl_engine_interface
 from tunix.generate import mappings
 from tunix.rl import rl_cluster as rl_engine_lib
 from tunix.rl import utils
@@ -37,7 +36,11 @@ from tunix.rl.rollout import mock_rollout
 from tunix.tests import test_common as tc
 
 # Some tests relying on SGLang and vLLM cannot run in run_core environment.
-is_run_core = os.environ.get('GITHUB_JOB') == 'run_core'
+is_run_core = (
+    os.environ.get('GITHUB_JOB') == 'run_core'
+    or importlib.util.find_spec('vllm') is None
+    or importlib.util.find_spec('sgl_jax') is None
+)
 
 PreTrainedTokenizerBase = tokenization_utils_base.PreTrainedTokenizerBase
 os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=4'

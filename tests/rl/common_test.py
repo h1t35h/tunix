@@ -1870,6 +1870,95 @@ class ProcessIdsTokenMaskTest(absltest.TestCase):
             np.asarray(logps_compact), np.asarray(logps_i16)
         )
 
+  def test_min_seq_len_norm_short_sequence_and_segmented(self):
+    """min_seq_len_norm floors sequence-length denominator at max(sum(m), L_min) across unsegmented and segmented reductions."""
+    # 1 sequence with 4 active tokens, each with per_token_loss = 2.0 (sum = 8.0).
+    # Without min_seq_len_norm: 8.0 / 4.0 = 2.0.
+    # With min_seq_len_norm=16.0: 8.0 / max(4.0, 16.0) = 8.0 / 16.0 = 0.5.
+    # With min_seq_len_norm=128.0: 8.0 / max(4.0, 128.0) = 8.0 / 128.0 = 0.0625.
+    per_token_loss = jnp.array(
+        [[2.0, 2.0, 2.0, 2.0, 99.0]], dtype=jnp.float32
+    )
+    comp_mask = jnp.array([[1.0, 1.0, 1.0, 1.0, 0.0]], dtype=jnp.float32)
+
+    agg_default = common.aggregate_loss(
+        per_token_loss, comp_mask, "sequence-mean-token-mean"
+    ).compute()
+    red_default = common.reduced_loss_agg(
+        per_token_loss, comp_mask, "sequence-mean-token-mean"
+    )
+    np.testing.assert_allclose(float(agg_default), 2.0, rtol=1e-6)
+    np.testing.assert_allclose(float(red_default), 2.0, rtol=1e-6)
+
+    for floor_val, expected in ((16.0, 0.5), (128.0, 0.0625)):
+      agg_floored = common.aggregate_loss(
+          per_token_loss,
+          comp_mask,
+          "sequence-mean-token-mean",
+          min_seq_len_norm=floor_val,
+      ).compute()
+      red_floored = common.reduced_loss_agg(
+          per_token_loss,
+          comp_mask,
+          "sequence-mean-token-mean",
+          min_seq_len_norm=floor_val,
+      )
+      np.testing.assert_allclose(float(agg_floored), expected, rtol=1e-6)
+      np.testing.assert_allclose(float(red_floored), expected, rtol=1e-6)
+
+      # Segmented path with 1 active segment (id=1) + padding (id=0):
+      seg_ids = jnp.array([[1, 1, 1, 1, 0]], dtype=jnp.int32)
+      agg_seg = common.aggregate_loss(
+          per_token_loss,
+          comp_mask,
+          "sequence-mean-token-mean",
+          segment_ids=seg_ids,
+          num_segments=2,
+          min_seq_len_norm=floor_val,
+      ).compute()
+      red_seg = common.reduced_loss_agg(
+          per_token_loss,
+          comp_mask,
+          "sequence-mean-token-mean",
+          segment_ids=seg_ids,
+          num_segments=2,
+          min_seq_len_norm=floor_val,
+      )
+      np.testing.assert_allclose(float(agg_seg), expected, rtol=1e-6)
+      np.testing.assert_allclose(float(red_seg), expected, rtol=1e-6)
+
+    with self.assertRaisesRegex(ValueError, "Invalid 'min_seq_len_norm'"):
+      common.aggregate_loss(
+          per_token_loss,
+          comp_mask,
+          "sequence-mean-token-mean",
+          min_seq_len_norm=0.5,
+      )
+
+  def test_train_example_token_flags_and_turn_fields(self):
+    """TrainExample carries token_flags, turn_ids, num_turn_segments, and token_mask."""
+    ex = common.TrainExample(
+        prompt_ids=np.array([[1, 2]], dtype=np.int32),
+        prompt_mask=np.array([[1, 1]], dtype=np.int32),
+        completion_ids=np.array([[3, 4, 5]], dtype=np.int32),
+        completion_mask=np.array([[1.0, 1.0, 0.0]], dtype=np.float32),
+        advantages=np.array([[1.0, -0.5, 0.0]], dtype=np.float32),
+        ref_per_token_logps=None,
+        old_per_token_logps=None,
+        token_mask=np.array([[True, True, True, True, False]]),
+        turn_ids=np.array([[1, 2, 0]], dtype=np.int32),
+        num_turn_segments=3,
+        token_flags=np.array([[0, 1, 0]], dtype=np.int8),
+    )
+    jax_ex = ex.to_jax_array()
+    self.assertIsInstance(jax_ex.token_flags, jax.Array)
+    self.assertIsInstance(jax_ex.turn_ids, jax.Array)
+    self.assertIsInstance(jax_ex.token_mask, jax.Array)
+    self.assertEqual(jax_ex.num_turn_segments, 3)
+    np.testing.assert_array_equal(
+        np.asarray(jax_ex.token_flags), np.array([[0, 1, 0]], dtype=np.int8)
+    )
+
 
 if __name__ == "__main__":
   absltest.main()

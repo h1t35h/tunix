@@ -541,9 +541,10 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
 
       # The full batch has 2 microbatches.
       # First iteration parallelized: 2 calls (1 per microbatch).
-      # Remaining 1 iteration: 1 call (passing the full batch of 2 microbatches).
-      # Total: 3 calls.
-      self.assertEqual(mock_update_actor.call_count, 3)
+      # Second iteration per-substep: 2 calls (1 per microbatch).
+      # Total: 4 calls.
+      self.assertEqual(mock_update_actor.call_count, 4)
+      self.assertLen(grpo_learner._step_telemetry_history, 4)
 
   def test_compute_logps_chunk_size(self):
     vocab = test_common.MockVocab()
@@ -2497,6 +2498,143 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
       self.assertFalse(train_example.sampler_agreement_applied)
       self.assertIsNone(train_example.sampler_is_weights)
 
+  def test_forward_only_old_logps_computes_non_null_old_per_token_logps_for_single_iteration(
+      self,
+  ):
+    """forward_only_old_logps=True populates old_per_token_logps via forward-only pass even when num_iterations=1 and use_rollout_logps=False."""
+    mesh = pxla.thread_resources.env.physical_mesh
+    model = test_common.ToyTransformer(
+        config=test_common.ModelConfig(vocab_size=32), rngs=nnx.Rngs(0)
+    )
+    cluster_config = rl_engine_lib.ClusterConfig(
+        role_to_mesh={
+            rl_engine_lib.Role.ACTOR: mesh,
+            rl_engine_lib.Role.REFERENCE: mesh,
+            rl_engine_lib.Role.ROLLOUT: mesh,
+        },
+        rollout_engine="vanilla",
+        training_config=rl_engine_lib.RLTrainingConfig(
+            actor_optimizer=optax.sgd(1e-3),
+            eval_every_n_steps=100,
+            max_seq_token_per_tpu=16,
+        ),
+        rollout_config=base_rollout.RolloutConfig(
+            max_prompt_length=8, max_tokens_to_generate=8, return_logprobs=True
+        ),
+    )
+    rl_engine = rl_engine_lib.RLEngine(
+        actor=model,
+        reference=model,
+        tokenizer=test_common.MockVocab(),
+        cluster_config=cluster_config,
+    )
+    learner = agentic_grpo_learner.GRPOLearner(
+        rl_engine=rl_engine,
+        reward_fns=None,
+        algo_config=agentic_grpo_learner.GRPOConfig(
+            beta=0.0,
+            epsilon=0.2,
+            num_generations=2,
+            num_iterations=1,
+            loss_algo="gspo-turn",
+            max_response_length=8,
+            use_rollout_logps=False,
+            forward_only_old_logps=True,
+        ),
+        chat_parser=MockChatParser(),
+    )
+    example = agentic_grpo_learner.TrainExample(
+        prompt_ids=jnp.ones((1, 4), jnp.int32),
+        prompt_mask=jnp.ones((1, 4), jnp.int32),
+        completion_ids=jnp.ones((1, 4), jnp.int32),
+        completion_mask=jnp.ones((1, 8), jnp.int32),
+        advantages=jnp.zeros((1,)),
+        old_per_token_logps=None,
+        ref_per_token_logps=None,
+        segment_ids=jnp.array([[1, 1, 1, 2, 2, 0, 0, 0]]),
+        segment_positions=jnp.arange(8).reshape(1, 8),
+    )
+    with mock.patch.object(
+        rl_engine,
+        "get_actor_per_token_logps",
+        return_value=jnp.full((1, 8), -0.42),
+    ) as actor_call:
+      out = learner._compute_packed_logps(example)
+    self.assertTrue(actor_call.called)
+    self.assertIsNotNone(out.old_per_token_logps)
+    np.testing.assert_allclose(out.old_per_token_logps, -0.42)
+
+  def test_multi_epoch_per_substep_telemetry_records_epoch_and_minibatch_indices(
+      self,
+  ):
+    """Multi-epoch / multi-minibatch training records per-substep telemetry with epoch_idx and mini_batch_idx."""
+    vocab = test_common.MockVocab()
+    tokenizer = tokenizer_adapter.TokenizerAdapter(vocab)
+    model = test_common.ToyTransformer(
+        config=test_common.ModelConfig(vocab_size=vocab.GetPieceSize()),
+        rngs=nnx.Rngs(0),
+    )
+    ref_model = test_common.ToyTransformer(
+        config=test_common.ModelConfig(vocab_size=vocab.GetPieceSize()),
+        rngs=nnx.Rngs(0),
+    )
+    mesh = pxla.thread_resources.env.physical_mesh
+    cluster_config = rl_engine_lib.ClusterConfig(
+        role_to_mesh={
+            rl_engine_lib.Role.ACTOR: mesh,
+            rl_engine_lib.Role.REFERENCE: mesh,
+            rl_engine_lib.Role.ROLLOUT: mesh,
+        },
+        rollout_engine="vanilla",
+        offload_to_cpu=False,
+        training_config=rl_engine_lib.RLTrainingConfig(
+            actor_optimizer=optax.sgd(1e-2),
+            eval_every_n_steps=100,
+            max_steps=10,
+            mini_batch_size=1,
+            train_micro_batch_size=1,
+            compute_logps_micro_batch_size=1,
+        ),
+        rollout_config=base_rollout.RolloutConfig(
+            max_prompt_length=256,
+            max_tokens_to_generate=10,
+            return_logprobs=True,
+            kv_cache_size=1024,
+        ),
+    )
+    rl_engine = rl_engine_lib.RLEngine(
+        actor=model,
+        reference=ref_model,
+        tokenizer=tokenizer,
+        cluster_config=cluster_config,
+    )
+    grpo_config = agentic_grpo_learner.GRPOConfig(
+        num_generations=2,
+        num_iterations=2,
+        loss_algo="grpo",
+        max_response_length=10,
+        use_rollout_logps=False,
+    )
+    grpo_learner = agentic_grpo_learner.GRPOLearner(
+        rl_engine=rl_engine,
+        reward_fns=reward_fn_1,
+        algo_config=grpo_config,
+        chat_parser=MockChatParser(),
+    )
+    train_ds = _dummy_dataset(MySource(data=["1", "2"], repeat=1), batch_size=2)
+    with mock.patch.object(
+        rl_engine,
+        "generate",
+        side_effect=self._mock_generate,
+    ):
+      grpo_learner.train(train_ds)
+
+    # 2 groups -> 2 mini-batches per epoch x 2 epochs = 4 optimizer substeps
+    history = grpo_learner._step_telemetry_history
+    self.assertLen(history, 4)
+    pairs = [(h["epoch_idx"], h["mini_batch_idx"]) for h in history]
+    self.assertEqual(pairs, [(0, 0), (0, 1), (1, 0), (1, 1)])
+
 
 class ExactTokenContinuityBatchTest(absltest.TestCase):
   """Real batch construction on a recorded exact trajectory; no model training."""
@@ -2687,6 +2825,483 @@ class ExactTokenContinuityBatchTest(absltest.TestCase):
     # without the explicit mask; with it, positions are contiguous.
     self.assertFalse(
         np.array_equal(np.asarray(with_mask), np.asarray(without_mask))
+    )
+
+  def test_process_results_mimo_and_hard_mask_2d_advantages_and_metrics(self):
+    from tunix.perf.experimental import tracer  # pylint: disable=g-import-not-at-top
+    from tunix.rl.agentic.agents import agent_types  # pylint: disable=g-import-not-at-top
+
+    for estimator, tok_mode in (("mimo", "mimo"), ("grpo", "mask")):
+      obj = object.__new__(agentic_grpo_learner.GRPOLearner)
+      obj.algo_config = agentic_grpo_learner.GRPOConfig(
+          exact_token_continuity=True,
+          max_response_length=12,
+          beta=0.0,
+          use_rollout_logps=True,
+          advantage_estimator=estimator,
+          token_advantage_mode=tok_mode,
+          num_generations=2,
+      )
+      obj._trajectory_logger = None
+      obj._full_batch_size = 0
+      obj.metric_fns = []
+      extracted_completions: list[str] = []
+
+      def _fake_rewards(prompts, completions, **kw):
+        del prompts, kw
+        extracted_completions.extend(completions)
+        return jnp.array([1.0, 0.0], dtype=jnp.float32)
+
+      obj._compute_rewards = _fake_rewards
+      buffer_mock = mock.Mock()
+      obj.rl_engine = types.SimpleNamespace(
+          rollout=types.SimpleNamespace(pad_id=lambda: 0, eos_id=lambda: 255),
+          r2m={rl_engine_lib.Role.ACTOR: None},
+          perf_v2=tracer.NoopTracer(),
+          buffer_metrics_async=buffer_mock,
+          cluster_config=types.SimpleNamespace(
+              rollout_config=base_rollout.RolloutConfig(max_prompt_length=5),
+              training_config=types.SimpleNamespace(
+                  max_seq_token_per_tpu=None,
+                  compute_logps_micro_batch_size=1,
+                  train_micro_batch_size=None,
+                  mini_batch_size=None,
+              ),
+          ),
+      )
+      t0 = self._raw_trajectory()
+      t0["conversation_text"] = [
+          {"role": "user", "content": "q"},
+          {"role": "assistant", "content": "turn1"},
+          {"role": "user", "content": "obs"},
+          {"role": "assistant", "content": "turn2"},
+      ]
+      t0["conversation_token_flags"] = np.array(
+          [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.int8
+      )
+      t0["judge"] = {
+          "passed": True,
+          "is_hack": False,
+          "quality": 1.0,
+          "assistant_len": 5,
+          "reason_hist": {"SYNTAX": 1},
+          "latency_s": 0.12,
+          "fallback": False,
+          "offsets_fallback_frac": 0.0,
+      }
+      t1 = self._raw_trajectory()
+      t1["trajectory_reward"] = 0.0
+      t1["conversation_token_flags"] = np.array(
+          [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.int8
+      )
+      t1["judge"] = {
+          "passed": False,
+          "is_hack": True,
+          "quality": 1.0,
+          "assistant_len": 5,
+          "reason_hist": {"TEST_HARDCODING": 1},
+          "latency_s": 0.12,
+          "fallback": False,
+          "offsets_fallback_frac": 0.0,
+      }
+      items = [
+          agent_types.TrajectoryItem(traj=t0),
+          agent_types.TrajectoryItem(traj=t1),
+      ]
+      batch = obj._process_results(items)[0]
+      self.assertEqual(batch.advantages.shape, (2, 12))
+      self.assertIsNotNone(batch.token_mask)
+      self.assertIsNotNone(batch.turn_ids)
+      self.assertGreaterEqual(int(batch.num_turn_segments or 0), 1)
+      # Clean token 1 on passing trajectory 0 has positive advantage
+      self.assertGreater(float(batch.advantages[0, 1]), 0.0)
+      if tok_mode == "mask":
+        # Under hard mask, flagged token 0 on passing trajectory 0 has zero advantage
+        self.assertEqual(float(batch.advantages[0, 0]), 0.0)
+      else:
+        # Under mimo (default span_beta_pos=0.5), flagged token 0 on passing trajectory 0
+        # retains discounted positive advantage (0 < adv[0, 0] < adv[0, 1])
+        self.assertGreater(float(batch.advantages[0, 0]), 0.0)
+        self.assertLess(
+            float(batch.advantages[0, 0]), float(batch.advantages[0, 1])
+        )
+      self.assertEqual(extracted_completions[0], "turn1\nturn2")
+      logged_keys = set()
+      for call in buffer_mock.call_args_list:
+        logged_keys.update(call.args[0].keys())
+      self.assertIn("judge/flagged_token_frac", logged_keys)
+      self.assertIn("judge/hack_frac", logged_keys)
+      self.assertIn("advantage/alpha", logged_keys)
+      self.assertIn("length_penalty/applied_frac", logged_keys)
+
+  def test_grpo_learner_forwards_group_stage_concurrency_and_timeout(self):
+    from tunix.rl import utils as rl_utils  # pylint: disable=g-import-not-at-top
+    from tunix.rl.agentic import agentic_rl_learner  # pylint: disable=g-import-not-at-top
+
+    class _DummyPostProcessor:
+
+      async def process_group(self, group):
+        return group
+
+    config = base_rollout.RolloutConfig(
+        max_tokens_to_generate=1024, return_logprobs=True
+    )
+    engine = mock.MagicMock()
+    engine.cluster_config.rollout_engine = "generic"
+    engine.cluster_config.rollout_config = config
+    engine.cluster_config.training_config.max_seq_token_per_tpu = None
+    engine.cluster_config.training_config.metrics_logging_options = None
+    postproc = _DummyPostProcessor()
+
+    with mock.patch.object(rl_utils, "is_sharing_weights", return_value=False):
+      learner = agentic_grpo_learner.GRPOLearner(
+          rl_engine=engine,
+          reward_fns=mock.Mock(),
+          algo_config=agentic_grpo_learner.GRPOConfig(),
+          chat_parser=object(),
+          group_postprocessor=postproc,
+          group_max_in_flight=6,
+          group_stage_timeout_s=45.0,
+      )
+    self.assertEqual(learner._group_max_in_flight, 6)
+    self.assertEqual(learner._group_stage_timeout_s, 45.0)
+
+    async def _empty_stream():
+      if False:  # pylint: disable=using-constant-test
+        yield []
+
+    with mock.patch.object(
+        agentic_rl_learner.group_postprocess,
+        "BoundedGroupStage",
+        wraps=agentic_rl_learner.group_postprocess.BoundedGroupStage,
+    ) as spy_stage:
+      _ = learner._wrap_group_stream(_empty_stream())
+      spy_stage.assert_called_once_with(
+          postproc, max_in_flight=6, timeout_s=45.0
+      )
+
+  def test_varying_num_turn_segments_concatenation(self):
+    """Groups with different turn counts (e.g. 2 vs 18 turns) normalize num_turn_segments and concatenate."""
+    import copy  # pylint: disable=g-import-not-at-top
+    from tunix.perf.experimental import tracer  # pylint: disable=g-import-not-at-top
+    from tunix.rl.agentic import agentic_rl_learner  # pylint: disable=g-import-not-at-top
+    from tunix.rl.agentic.agents import agent_types  # pylint: disable=g-import-not-at-top
+
+    obj = object.__new__(agentic_grpo_learner.GRPOLearner)
+    obj.algo_config = agentic_grpo_learner.GRPOConfig(
+        exact_token_continuity=True,
+        max_response_length=40,
+        beta=0.0,
+        use_rollout_logps=True,
+    )
+    obj._trajectory_logger = None
+    obj._full_batch_size = 0
+    obj.metric_fns = []
+    obj._compute_rewards = lambda **kw: jnp.array([0.0, 1.0])
+    obj.rl_engine = types.SimpleNamespace(
+        rollout=types.SimpleNamespace(pad_id=lambda: 0, eos_id=lambda: 255),
+        r2m={rl_engine_lib.Role.ACTOR: None},
+        perf_v2=tracer.NoopTracer(),
+        buffer_metrics_async=mock.Mock(),
+        cluster_config=types.SimpleNamespace(
+            rollout_config=base_rollout.RolloutConfig(max_prompt_length=5),
+            training_config=types.SimpleNamespace(
+                max_seq_token_per_tpu=None,
+                compute_logps_micro_batch_size=1,
+                train_micro_batch_size=None,
+                mini_batch_size=None,
+            ),
+        ),
+    )
+
+    # Group A: 3 turns (num_turn_segments = max(16, 4) = 16)
+    raw_a = self._raw_trajectory()
+    batch_a = obj._process_results([
+        agent_types.TrajectoryItem(traj=copy.deepcopy(raw_a)) for _ in range(2)
+    ])[0]
+    self.assertEqual(batch_a.num_turn_segments, 16)
+
+    # Group B: 18 turns (max_turn_id = 18 -> num_turn_segments = max(16, 19) = 19)
+    raw_18 = self._raw_trajectory()
+    conv_tokens = np.tile(np.array([10, 20], dtype=np.int32), 18)
+    conv_masks = np.tile(np.array([1, 0], dtype=np.int32), 18)
+    raw_18.update(
+        conversation_tokens=conv_tokens,
+        conversation_masks=conv_masks,
+        old_logprobs=conv_masks.astype(np.float32) * -0.5,
+    )
+    batch_b = obj._process_results([
+        agent_types.TrajectoryItem(traj=copy.deepcopy(raw_18)) for _ in range(2)
+    ])[0]
+    self.assertEqual(batch_b.num_turn_segments, 19)
+
+    normalized = (
+        agentic_rl_learner.AgenticRLLearner._normalize_micro_batch_metadata(
+            [batch_a, batch_b]
+        )
+    )
+    self.assertEqual(normalized[0].num_turn_segments, 19)
+    self.assertEqual(normalized[1].num_turn_segments, 19)
+    merged = jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *normalized)
+    self.assertEqual(merged.completion_ids.shape, (4, 40))
+    self.assertEqual(merged.num_turn_segments, 19)
+
+  def test_multi_minibatch_old_logps_computed_before_update_actor(self):
+    """All micro-batches in a full rollout batch must compute pi_old before update_actor mutates weights."""
+    vocab = test_common.MockVocab()
+    tokenizer = tokenizer_adapter.TokenizerAdapter(vocab)
+    model = test_common.ToyTransformer(
+        config=test_common.ModelConfig(vocab_size=vocab.GetPieceSize()),
+        rngs=nnx.Rngs(0),
+    )
+    ref_model = test_common.ToyTransformer(
+        config=test_common.ModelConfig(vocab_size=vocab.GetPieceSize()),
+        rngs=nnx.Rngs(0),
+    )
+    mesh = pxla.thread_resources.env.physical_mesh
+    cluster_config = rl_engine_lib.ClusterConfig(
+        role_to_mesh={
+            rl_engine_lib.Role.ACTOR: mesh,
+            rl_engine_lib.Role.REFERENCE: mesh,
+            rl_engine_lib.Role.ROLLOUT: mesh,
+        },
+        rollout_engine="vanilla",
+        offload_to_cpu=False,
+        training_config=rl_engine_lib.RLTrainingConfig(
+            actor_optimizer=optax.sgd(1e-2),
+            eval_every_n_steps=100,
+            max_steps=10,
+            mini_batch_size=1,
+            train_micro_batch_size=1,
+            compute_logps_micro_batch_size=1,
+        ),
+        rollout_config=base_rollout.RolloutConfig(
+            max_prompt_length=256,
+            max_tokens_to_generate=10,
+            return_logprobs=True,
+            kv_cache_size=1024,
+        ),
+    )
+    rl_engine = rl_engine_lib.RLEngine(
+        actor=model,
+        reference=ref_model,
+        tokenizer=tokenizer,
+        cluster_config=cluster_config,
+    )
+    grpo_config = agentic_grpo_learner.GRPOConfig(
+        num_generations=2,
+        num_iterations=1,
+        loss_algo="grpo",
+        max_response_length=10,
+        use_rollout_logps=False,
+    )
+    grpo_learner = agentic_grpo_learner.GRPOLearner(
+        rl_engine=rl_engine,
+        reward_fns=reward_fn_1,
+        algo_config=grpo_config,
+        chat_parser=MockChatParser(),
+    )
+    # 1 full rollout batch of 4 prompts -> 4 micro-batches of 1 group each (update_steps_per_full_batch=4).
+    train_ds = _dummy_dataset(
+        MySource(data=["1", "2", "3", "4"], repeat=1), batch_size=4
+    )
+
+    events = []
+    orig_get_actor_logps = rl_engine.get_actor_per_token_logps
+    orig_update_actor = rl_engine.update_actor
+    actor_version = {"v": 0}
+
+    def _spy_get_actor_logps(*args, **kwargs):
+      events.append(("compute_old_logps", actor_version["v"]))
+      return orig_get_actor_logps(*args, **kwargs)
+
+    def _spy_update_actor(train_batches, *args, **kwargs):
+      n_batches = len(list(train_batches))
+      res = orig_update_actor(train_batches, *args, **kwargs)
+      actor_version["v"] += n_batches
+      events.append(("update_actor", actor_version["v"]))
+      return res
+
+    with (
+        mock.patch.object(
+            rl_engine,
+            "get_actor_per_token_logps",
+            side_effect=_spy_get_actor_logps,
+        ),
+        mock.patch.object(
+            rl_engine,
+            "update_actor",
+            side_effect=_spy_update_actor,
+        ),
+        mock.patch.object(
+            rl_engine,
+            "generate",
+            side_effect=functools.partial(_mock_generate, tokenizer=tokenizer),
+        ),
+    ):
+      grpo_learner.train(train_ds)
+
+    # All 4 micro-batches must have computed old_per_token_logps at actor_version == 0
+    # BEFORE update_actor was invoked!
+    old_logp_versions = [v for ev, v in events if ev == "compute_old_logps"]
+    self.assertEqual(old_logp_versions, [0, 0, 0, 0])
+    self.assertEqual(events[-1][0], "update_actor")
+
+  def test_flagged_token_frac_and_tagged_group_frac_metrics(self):
+    """judge/flagged_token_frac is computed strictly over tagged groups while judge/tagged_group_frac tracks tagged group ratio."""
+    import copy  # pylint: disable=g-import-not-at-top
+    from tunix.perf.experimental import tracer  # pylint: disable=g-import-not-at-top
+    from tunix.rl.agentic.agents import agent_types  # pylint: disable=g-import-not-at-top
+
+    obj = object.__new__(agentic_grpo_learner.GRPOLearner)
+    obj.algo_config = agentic_grpo_learner.GRPOConfig(
+        exact_token_continuity=True,
+        max_response_length=10,
+        beta=0.0,
+        use_rollout_logps=True,
+    )
+    obj._trajectory_logger = None
+    obj._full_batch_size = 0
+    obj.metric_fns = []
+    obj._compute_rewards = lambda **kw: jnp.array([1.0, 0.0, 0.0, 0.0])
+    buffered_metrics = mock.Mock()
+    obj.rl_engine = types.SimpleNamespace(
+        rollout=types.SimpleNamespace(pad_id=lambda: 0, eos_id=lambda: 255),
+        r2m={rl_engine_lib.Role.ACTOR: None},
+        perf_v2=tracer.NoopTracer(),
+        buffer_metrics_async=buffered_metrics,
+        cluster_config=types.SimpleNamespace(
+            rollout_config=base_rollout.RolloutConfig(max_prompt_length=5),
+            training_config=types.SimpleNamespace(
+                max_seq_token_per_tpu=None,
+                compute_logps_micro_batch_size=4,
+                train_micro_batch_size=None,
+                mini_batch_size=None,
+            ),
+        ),
+    )
+
+    def _make_traj(group_id, passed, tagged_group, flags):
+      raw = copy.deepcopy(self._raw_trajectory())
+      raw["group_id"] = group_id
+      raw["trajectory_reward"] = 1.0 if passed else 0.0
+      raw["conversation_tokens"] = np.array([10, 20, 30, 40], dtype=np.int32)
+      raw["conversation_masks"] = np.array([1, 1, 1, 1], dtype=np.int32)
+      raw["old_logprobs"] = np.array([-0.1, -0.1, -0.1, -0.1], dtype=np.float32)
+      raw["conversation_token_flags"] = np.array(flags, dtype=np.int8)
+      raw["judge"] = {
+          "passed": passed,
+          "turn1_passed": passed,
+          "final_passed": passed,
+          "assistant_len": 4,
+          "is_hack": False,
+          "quality": 1.0,
+          "reason_hist": {},
+          "latency_s": 0.01,
+          "fallback": False,
+          "offsets_fallback_frac": 0.0,
+          "tagged_group": tagged_group,
+      }
+      return agent_types.TrajectoryItem(traj=raw)
+
+    trajs = [
+        _make_traj("g1", True, True, [0, 0, 0, 0]),
+        _make_traj("g1", False, True, [1, 1, 0, 0]),
+        _make_traj("g2", False, False, [0, 0, 0, 0]),
+        _make_traj("g2", False, False, [0, 0, 0, 0]),
+    ]
+    obj._process_results(trajs)
+    metrics_dict = buffered_metrics.call_args.args[0]
+    # Only g1 (2 trajectories, 8 assistant tokens, 2 flagged tokens) is a tagged group -> 2/8 = 0.25 (not 2/16 = 0.125!)
+    self.assertAlmostEqual(
+        float(metrics_dict["judge/flagged_token_frac"][0]), 0.25
+    )
+    self.assertAlmostEqual(
+        float(metrics_dict["judge/tagged_group_frac"][0]), 0.5
+    )
+
+  def test_train_example_token_flags_and_batch_flagged_frac_metric(self):
+    """Verifies TrainExample.token_flags propagation and judge/flagged_token_frac_batch vs tagged metrics."""
+    import copy  # pylint: disable=g-import-not-at-top
+    from tunix.perf.experimental import tracer  # pylint: disable=g-import-not-at-top
+    from tunix.rl.agentic.agents import agent_types  # pylint: disable=g-import-not-at-top
+
+    obj = object.__new__(agentic_grpo_learner.GRPOLearner)
+    obj.algo_config = agentic_grpo_learner.GRPOConfig(
+        exact_token_continuity=True,
+        max_response_length=6,
+        advantage_estimator="mimo",
+        token_advantage_mode="mimo",
+        loss_algo="gspo-turn",
+        gspo_pool_mode="turn_span",
+        clip_mode="mask",
+        use_rollout_logps=True,
+        beta=0.0,
+    )
+    obj._trajectory_logger = None
+    obj._full_batch_size = 0
+    obj.metric_fns = []
+    obj._compute_rewards = lambda **kw: jnp.array([1.0, 0.0, 0.0, 0.0])
+    buffered_metrics = mock.Mock()
+    obj.rl_engine = types.SimpleNamespace(
+        rollout=types.SimpleNamespace(pad_id=lambda: 0, eos_id=lambda: 255),
+        r2m={rl_engine_lib.Role.ACTOR: None},
+        perf_v2=tracer.NoopTracer(),
+        buffer_metrics_async=buffered_metrics,
+        cluster_config=types.SimpleNamespace(
+            rollout_config=base_rollout.RolloutConfig(max_prompt_length=5),
+            training_config=types.SimpleNamespace(
+                max_seq_token_per_tpu=None,
+                compute_logps_micro_batch_size=4,
+                train_micro_batch_size=None,
+                mini_batch_size=None,
+            ),
+        ),
+    )
+
+    def _make_traj(group_id, passed, tagged_group, flags):
+      raw = copy.deepcopy(self._raw_trajectory())
+      raw["group_id"] = group_id
+      raw["trajectory_reward"] = 1.0 if passed else 0.0
+      raw["conversation_tokens"] = np.array([10, 20, 30, 40], dtype=np.int32)
+      raw["conversation_masks"] = np.array([1, 1, 1, 1], dtype=np.int32)
+      raw["old_logprobs"] = np.array([-0.1, -0.1, -0.1, -0.1], dtype=np.float32)
+      raw["conversation_token_flags"] = np.array(flags, dtype=np.int8)
+      raw["judge"] = {
+          "passed": passed,
+          "turn1_passed": passed,
+          "final_passed": passed,
+          "assistant_len": 4,
+          "is_hack": False,
+          "quality": 1.0,
+          "reason_hist": {},
+          "latency_s": 0.01,
+          "fallback": False,
+          "offsets_fallback_frac": 0.0,
+          "tagged_group": tagged_group,
+      }
+      return agent_types.TrajectoryItem(traj=raw)
+
+    trajs = [
+        _make_traj("g1", True, True, [0, 0, 0, 0]),
+        _make_traj("g1", False, True, [1, 1, 0, 0]),
+        _make_traj("g2", False, False, [0, 0, 0, 0]),
+        _make_traj("g2", False, False, [0, 0, 0, 0]),
+    ]
+    examples = obj._process_results(trajs)
+    self.assertLen(examples, 1)
+    ex = examples[0]
+    self.assertIsNotNone(ex.token_flags)
+    self.assertEqual(ex.token_flags.shape, (4, 6))
+    np.testing.assert_array_equal(
+        np.asarray(ex.token_flags[1]), np.array([1, 1, 0, 0, 0, 0], np.int8)
+    )
+    metrics_dict = buffered_metrics.call_args.args[0]
+    self.assertAlmostEqual(
+        float(metrics_dict["judge/flagged_token_frac_tagged"][0]), 0.25
+    )
+    self.assertAlmostEqual(
+        float(metrics_dict["judge/flagged_token_frac_batch"][0]), 0.125
     )
 
 

@@ -14,9 +14,49 @@
 
 from collections.abc import Sequence
 import dataclasses
+
 from absl import logging
 from tunix.common import datatypes as common_datatypes
 from tunix.rl import function_registry
+
+
+@dataclasses.dataclass(slots=True, kw_only=True)
+class MimoAdvantageConfig:
+  """Configuration for MiMo advantage shaping (LP + GAR + SPAN)."""
+
+  lp_pass_rate_threshold: float = 0.5
+  lp_max_penalty: float = 0.4
+  lp_dead_zone: float = 0.2
+  lp_saturation: float = 1.0
+  lp_gamma: float = 1.0
+  gar_lambda_max: float = 2.0
+  gar_rank_rho: float = 0.5
+  span_kappa: float = 1.5
+  span_alpha_max: float = 2.0
+  span_beta_min: float = 0.5
+  span_beta_pos: float = 0.5
+  span_renormalize: bool = True
+  std_normalize: bool = True
+
+  def __post_init__(self) -> None:
+    if not (0.0 <= self.lp_pass_rate_threshold <= 1.0):
+      raise ValueError("lp_pass_rate_threshold must be in [0, 1].")
+    if self.lp_max_penalty < 0.0:
+      raise ValueError("lp_max_penalty must be >= 0.")
+    if self.lp_saturation <= self.lp_dead_zone:
+      raise ValueError("lp_saturation must be > lp_dead_zone.")
+    if self.gar_lambda_max < 1.0:
+      raise ValueError("gar_lambda_max must be >= 1.0.")
+    if not (0.0 <= self.gar_rank_rho <= 1.0):
+      raise ValueError("gar_rank_rho must be in [0, 1].")
+    if self.span_kappa < 1.0:
+      raise ValueError("span_kappa must be >= 1.0.")
+    if self.span_alpha_max < 1.0:
+      raise ValueError("span_alpha_max must be >= 1.0.")
+    if not (0.0 <= self.span_beta_min <= 1.0):
+      raise ValueError("span_beta_min must be in [0, 1].")
+    if not (0.0 <= self.span_beta_pos <= 1.0):
+      raise ValueError("span_beta_pos must be in [0, 1].")
 
 
 @dataclasses.dataclass(slots=True, kw_only=True)
@@ -78,7 +118,7 @@ class AlgorithmConfig:
   # probabilities and entropy in the loss function.
   # NB: This should not be configured manually, instead it will be set by the RL
   # engine based on the rollout config.
-  temperature: float | None = dataclasses.field(default=None, init=False)
+  temperature: float | None = None
   # Whether to use rollout-side log probabilities as old-policy log
   # probabilities. If False, recompute old-policy log probabilities on the
   # trainer actor.
@@ -104,17 +144,42 @@ class AlgorithmConfig:
   # IDs happen to be `< 255` do not flip between 4D `uint8` and 5D `uint10`
   # across steps and trigger an extra XLA compilation.
   routed_experts_num_experts: int | None = None
+  clip_mode: str = "ppo"
+  epsilon_neg: float | None = None
+  epsilon_neg_high: float | None = None
+  token_advantage_mode: str = "none"
+  gspo_pool_mode: str = "sequence"
+  mimo: MimoAdvantageConfig | None = None
+  audit_only: bool = False
+  enable_thinking: bool = False
+  forward_only_old_logps: bool = False
+  max_flagged_token_ratio_per_turn: float = 0.35
+  max_flagged_token_frac: float | None = None
+  gspo_length_adaptive_clipping: bool = False
+  length_adaptive_epsilon: bool = False
+  gspo_ref_length: int = 1024
+  length_adaptive_base_len: int | None = None
+  gspo_clip_min: float = 0.001
+  gspo_clip_max: float = 0.05
+  min_seq_len_norm: float | None = None
 
-  def __post_init__(self):
-    self.temperature = None
+  def __post_init__(self) -> None:
     valid_algo_variants = [
         "grpo",
         "drgrpo",
         "gspo-token",
+        "gspo-turn",
         "ppo",
         "dapo",
     ]
-    valid_advantage_estimators = ["grpo", "gae", "drgrpo", "rloo", "grpo-loo"]
+    valid_advantage_estimators = [
+        "grpo",
+        "gae",
+        "drgrpo",
+        "rloo",
+        "grpo-loo",
+        "mimo",
+    ]
     valid_policy_loss_fns = ["grpo", "ppo"]
     valid_reward_modes = ["reward_fn", "env"]
     if self.algo_variant not in valid_algo_variants:
@@ -167,6 +232,7 @@ class AlgorithmConfig:
         self.routed_experts_num_experts,
     )
     self._validate_sampler_is_and_rs_options()
+    self._validate_clip_and_token_advantage_options()
 
     # Automatically prints configuration upon initialization.
     self.print_config()
@@ -176,7 +242,67 @@ class AlgorithmConfig:
     """Whether reference-model KL log-probabilities must be computed."""
     return self.beta != 0.0 or self.force_compute_kl
 
-  def _validate_sampler_is_and_rs_options(self):
+  def _validate_clip_and_token_advantage_options(
+      self, loss_algo: str = "grpo"
+  ) -> None:
+    """Validates clip_mode, gspo_pool_mode, and token_advantage_mode options."""
+    del loss_algo
+    if self.length_adaptive_epsilon:
+      self.gspo_length_adaptive_clipping = True
+    if self.length_adaptive_base_len is not None:
+      self.gspo_ref_length = self.length_adaptive_base_len
+    if self.max_flagged_token_frac is not None:
+      self.max_flagged_token_ratio_per_turn = self.max_flagged_token_frac
+    self.length_adaptive_epsilon = self.gspo_length_adaptive_clipping
+    self.length_adaptive_base_len = self.gspo_ref_length
+    self.max_flagged_token_frac = self.max_flagged_token_ratio_per_turn
+
+    if self.clip_mode not in ("ppo", "mask"):
+      raise ValueError(
+          f"clip_mode must be 'ppo' or 'mask'. Received: {self.clip_mode!r}"
+      )
+    if self.token_advantage_mode not in ("none", "mask", "mimo"):
+      raise ValueError(
+          "token_advantage_mode must be 'none', 'mask', or 'mimo'. "
+          f"Received: {self.token_advantage_mode!r}"
+      )
+    if (
+        self.token_advantage_mode == "mimo"
+        and self.advantage_estimator != "mimo"
+    ):
+      raise ValueError(
+          "token_advantage_mode='mimo' requires advantage_estimator='mimo'. "
+          f"Received advantage_estimator={self.advantage_estimator!r}."
+      )
+    if self.gspo_pool_mode not in ("sequence", "turn", "span", "turn_span"):
+      raise ValueError(
+          "gspo_pool_mode must be 'sequence', 'turn', 'span', or 'turn_span'. "
+          f"Received: {self.gspo_pool_mode!r}"
+      )
+    if not 0.0 < self.max_flagged_token_ratio_per_turn <= 1.0:
+      raise ValueError(
+          "max_flagged_token_ratio_per_turn must be in (0.0, 1.0]. "
+          f"Received: {self.max_flagged_token_ratio_per_turn}"
+      )
+    if self.gspo_ref_length <= 0:
+      raise ValueError(
+          f"gspo_ref_length must be > 0. Received: {self.gspo_ref_length}"
+      )
+    if self.gspo_clip_min <= 0.0 or self.gspo_clip_min > self.gspo_clip_max:
+      raise ValueError(
+          "gspo_clip_min and gspo_clip_max must satisfy 0.0 < gspo_clip_min <="
+          f" gspo_clip_max. Received: min={self.gspo_clip_min},"
+          f" max={self.gspo_clip_max}"
+      )
+    if self.min_seq_len_norm is not None and self.min_seq_len_norm < 1.0:
+      raise ValueError(
+          "min_seq_len_norm must be >= 1.0 when set. "
+          f"Received: {self.min_seq_len_norm}"
+      )
+    if self.mimo is None and self.advantage_estimator == "mimo":
+      self.mimo = MimoAdvantageConfig()
+
+  def _validate_sampler_is_and_rs_options(self) -> None:
     """Checks sampler-vs-trainer error masking, IS, and RS options.
 
     Raises:
@@ -230,7 +356,7 @@ class AlgorithmConfig:
           " sampler_rs_max."
       )
 
-  def print_config(self):
+  def print_config(self) -> None:
     """Prints all configuration fields, working dynamically for child classes."""
     logging.info(f"Initializing {self.__class__.__name__}:")
     for field in dataclasses.fields(self):
@@ -254,7 +380,7 @@ class GRPOConfig(AlgorithmConfig):
       Default: `reward_fn`.
     loss_algo: use GRPO or GSPO for loss computation. GRPO loss is per-batch
       normalized instead of per-response normalized as mentioned in the paper.
-      For GSPO, we use gspo-token loss which is more flexible.
+      For GSPO, we use gspo-token or gspo-turn loss which is more flexible.
     num_generations: The number of times the policy generates multiple responses
       for a given prompt within a single training step. This corresponds to 'G'
       in Algorithm 1 in the `paper <https://arxiv.org/abs/2402.03300>`_. A
@@ -315,9 +441,15 @@ class GRPOConfig(AlgorithmConfig):
   epsilon_high: float | None = None
   epsilon_c: float | None = None
 
-  def __post_init__(self):
+  def __post_init__(self) -> None:
     if self.epsilon_high is None:
       self.epsilon_high = self.epsilon
+    if self.epsilon_neg is None:
+      self.epsilon_neg = self.epsilon
+    if self.epsilon_neg_high is None:
+      self.epsilon_neg_high = self.epsilon_high
+    if self.loss_algo == "gspo-turn" and self.gspo_pool_mode == "sequence":
+      self.gspo_pool_mode = "turn"
 
     if self.num_generations <= 1:
       raise ValueError(
@@ -327,11 +459,12 @@ class GRPOConfig(AlgorithmConfig):
 
     super().__post_init__()
 
-    if self.loss_algo not in ["grpo", "gspo-token"]:
+    if self.loss_algo not in ["grpo", "gspo-token", "gspo-turn"]:
       raise ValueError(
-          "loss_algo should be either grpo or gspo-token. Received: "
-          f"{self.loss_algo}"
+          "loss_algo should be either grpo or gspo-token (or gspo-turn)."
+          f" Received: {self.loss_algo}"
       )
+    self._validate_clip_and_token_advantage_options(loss_algo=self.loss_algo)
 
 
 @dataclasses.dataclass(kw_only=True)

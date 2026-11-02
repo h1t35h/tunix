@@ -133,6 +133,13 @@ class TrainExample:
   sampler_agreement_applied: bool = flax.struct.field(
       default=False, pytree_node=False
   )
+  completion_attention_mask: ArrayType | None = None
+  token_mask: ArrayType | None = None
+  turn_ids: ArrayType | None = None
+  num_turn_segments: int | None = flax.struct.field(
+      default=None, pytree_node=False
+  )
+  token_flags: ArrayType | None = None
 
   def to_jax_array(self) -> "TrainExample":
     """Returns a copy of the batch with all array fields moved to JAX array."""
@@ -630,9 +637,9 @@ def compute_per_token_logps(
       return per_token_logps, per_token_entropy  # pyrefly: ignore[unbound-name]
     return per_token_logps
   else:
-    logits = outputs[:, -logits_to_keep - 1 : -1, :]
+    logits = outputs[:, -logits_to_keep - 1 : -1, :].astype(jnp.float32)
     if temperature != 0.0 and temperature != 1.0:
-      logits /= temperature
+      logits = logits / jnp.asarray(temperature, dtype=jnp.float32)
 
     per_token_logps = selective_log_softmax(logits, input_tokens_to_keep)
 
@@ -1586,10 +1593,9 @@ def aggregate_loss(
     denominator = completion_mask.sum()
     min_denom = 1.0
   elif loss_agg_mode == "sequence-mean-token-mean":
+    min_seq_len = _check_get_min_seq_len_norm(kwargs)
     seq_mask = completion_mask.sum(axis=-1)  # per-sequence token count
-    seq_loss = per_token_loss.sum(axis=-1) / jnp.clip(
-        seq_mask, min=1.0
-    )
+    seq_loss = per_token_loss.sum(axis=-1) / jnp.clip(seq_mask, min=min_seq_len)
     unreduced_sum = seq_loss.sum()
     # Count non-empty rows so unpacked [N_max, R] padding rows do not inflate the
     # denominator (matches seq-mean-token-sum). For a fully-populated batch this
@@ -1685,7 +1691,8 @@ def _aggregate_loss_segmented(
     denominator = completion_mask.sum()
     min_denom = 1.0
   elif loss_agg_mode == "sequence-mean-token-mean":
-    per_seg_mean = l_seg / jnp.clip(c_seg, min=1.0)
+    min_seq_len = _check_get_min_seq_len_norm(kwargs)
+    per_seg_mean = l_seg / jnp.clip(c_seg, min=min_seq_len)
     unreduced_sum = per_seg_mean.sum()
     denominator = n_act
     min_denom = 1.0
@@ -1782,10 +1789,9 @@ def reduced_loss_agg(
         completion_mask.sum(), min=1.0
     )
   elif loss_agg_mode == "sequence-mean-token-mean":
+    min_seq_len = _check_get_min_seq_len_norm(kwargs)
     seq_mask = completion_mask.sum(axis=-1)
-    seq_loss = per_token_loss.sum(axis=-1) / jnp.clip(
-        seq_mask, min=1.0
-    )
+    seq_loss = per_token_loss.sum(axis=-1) / jnp.clip(seq_mask, min=min_seq_len)
     n_act = (seq_mask > 0).sum()
     return seq_loss.sum() / jnp.clip(n_act, min=1.0)
   elif loss_agg_mode == "sequence-mean-token-scale":
@@ -1857,7 +1863,8 @@ def _reduced_loss_agg_segmented(
   if loss_agg_mode == "token-mean":
     return per_token_loss.sum() / jnp.clip(completion_mask.sum(), min=1.0)
   elif loss_agg_mode == "sequence-mean-token-mean":
-    per_seg_mean = l_seg / jnp.clip(c_seg, min=1.0)
+    min_seq_len = _check_get_min_seq_len_norm(kwargs)
+    per_seg_mean = l_seg / jnp.clip(c_seg, min=min_seq_len)
     return per_seg_mean.sum() / jnp.clip(n_act, min=1.0)
   elif loss_agg_mode == "sequence-mean-token-scale":
     if "norm" not in kwargs:
@@ -1931,6 +1938,30 @@ def compute_entropy_from_logits(logits: jax.Array) -> jax.Array:
   )
   log_probs = jax.nn.log_softmax(logits_f32, axis=-1)
   return -jnp.sum(jnp.exp(log_probs) * log_probs, axis=-1)
+
+
+def _check_get_min_seq_len_norm(
+    arguments: dict[str, float | int | None],
+) -> float:
+  """Gets optional minimum sequence length normalization floor from kwargs."""
+  if (
+      "min_seq_len_norm" in arguments
+      and arguments["min_seq_len_norm"] is not None
+  ):
+    try:
+      min_seq_len_norm = float(arguments["min_seq_len_norm"])
+    except (ValueError, TypeError) as exc:
+      raise ValueError(
+          f"Invalid 'min_seq_len_norm' value: {arguments['min_seq_len_norm']}."
+          " Must be a number >= 1.0."
+      ) from exc
+    if min_seq_len_norm < 1.0:
+      raise ValueError(
+          f"Invalid 'min_seq_len_norm' value: {min_seq_len_norm}."
+          " Must be >= 1.0."
+      )
+    return min_seq_len_norm
+  return 1.0
 
 
 def _check_get_norm(arguments: dict[str, Any], default: Any) -> Any:

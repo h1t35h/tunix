@@ -170,6 +170,10 @@ class BaseEnv(abc.ABC):
     # Default implementation: nothing to clean up.
     return
 
+  def export_trajectory_extras(self) -> Dict[str, Any]:
+    """Export environment-specific episode artifacts into trajectory results."""
+    return {}
+
   @classmethod
   def from_dict(cls, env_args: Dict[str, Any]) -> "BaseEnv":
     """Create an environment instance from a configuration dictionary.

@@ -470,8 +470,17 @@ class AlgoCoreTest(absltest.TestCase):
           beta=0.0,
           epsilon=0.2,
           epsilon_high=0.2,
+          epsilon_neg=0.2,
+          epsilon_neg_high=0.2,
           epsilon_c=None,
+          clip_mode='ppo',
           loss_algo=loss_algo,
+          gspo_pool_mode='sequence',
+          gspo_length_adaptive_clipping=False,
+          gspo_ref_length=1024,
+          gspo_clip_min=0.001,
+          gspo_clip_max=0.05,
+          min_seq_len_norm=None,
           loss_agg_mode='sequence-mean-token-mean',
           temperature=1.0,
           kl_loss_mode='low_var_kl',
@@ -566,8 +575,17 @@ class AlgoCoreTest(absltest.TestCase):
             beta=0.0,
             epsilon=0.2,
             epsilon_high=0.2,
+            epsilon_neg=0.2,
+            epsilon_neg_high=0.2,
             epsilon_c=None,
+            clip_mode='ppo',
             loss_algo='grpo',
+            gspo_pool_mode='sequence',
+            gspo_length_adaptive_clipping=False,
+            gspo_ref_length=1024,
+            gspo_clip_min=0.001,
+            gspo_clip_max=0.05,
+            min_seq_len_norm=None,
             loss_agg_mode='token-mean',
             temperature=1.0,
             kl_loss_mode='low_var_kl',
@@ -700,9 +718,18 @@ class GrpoLossSequenceLevelControlsTest(absltest.TestCase):
         epsilon=0.2,
         epsilon_low=0.2,
         epsilon_high=0.2,
+        epsilon_neg=0.2,
+        epsilon_neg_high=0.2,
         epsilon_c=None,
         entropy_coef=0.0,
+        clip_mode='ppo',
         loss_algo='grpo',
+        gspo_pool_mode='sequence',
+        gspo_length_adaptive_clipping=False,
+        gspo_ref_length=1024,
+        gspo_clip_min=0.001,
+        gspo_clip_max=0.05,
+        min_seq_len_norm=None,
         loss_agg_mode='sequence-mean-token-mean',
         temperature=1.0,
         kl_loss_mode='low_var_kl',
@@ -1291,6 +1318,473 @@ class GrpoLossSequenceLevelControlsTest(absltest.TestCase):
     )
     np.testing.assert_allclose(
         float(out.aux_metrics['pg_clipfrac_lower'].compute()), 0.5, rtol=1e-5
+    )
+
+  def test_clip_mode_mask_zero_gradient_and_asymmetric_bounds(self):
+    """clip_mode='mask' yields exact 0.0 grad wrt per_token_logps outside trust region."""
+    from unittest import mock  # pylint: disable=g-import-not-at-top
+    from tunix.rl import common  # pylint: disable=g-import-not-at-top
+
+    # 2 trajectories x 3 tokens:
+    # Row 0 (adv > 0, bounds [1 - 0.05, 1 + 0.06] = [0.95, 1.06]):
+    #   tok 0: ratio = 1.00 (inside) -> grad != 0
+    #   tok 1: ratio = 0.85 (< 0.95, pessimistic bound) -> PPO grad != 0, mask grad == 0.0
+    #   tok 2: ratio = 1.10 (> 1.06, optimistic bound) -> mask grad == 0.0
+    # Row 1 (adv < 0, asymmetric bounds [1 - 0.06, 1 + 0.05] = [0.94, 1.05]):
+    #   tok 0: ratio = 0.945 (inside [0.94, 1.05], though < 0.95) -> mask grad != 0
+    #   tok 1: ratio = 1.055 (> 1.05, though < 1.06) -> mask grad == 0.0
+    #   tok 2: ratio = 0.85 (< 0.94) -> mask grad == 0.0
+    ratios = jnp.array(
+        [[1.00, 0.85, 1.10], [0.945, 1.055, 0.85]], dtype=jnp.float32
+    )
+    old_logps = jnp.full((2, 3), -2.0, dtype=jnp.float32)
+    target_logps = old_logps + jnp.log(ratios)
+    advantages = jnp.array(
+        [[2.0, 2.0, 2.0], [-1.5, -1.5, -1.5]], dtype=jnp.float32
+    )
+    comp_mask = jnp.ones((2, 3), dtype=jnp.float32)
+
+    ex = common.TrainExample(
+        prompt_ids=jnp.array([[1, 2], [1, 2]], dtype=jnp.int32),
+        prompt_mask=jnp.ones((2, 2), dtype=jnp.int32),
+        completion_ids=jnp.array([[3, 4, 5], [6, 7, 3]], dtype=jnp.int32),
+        completion_mask=comp_mask,
+        advantages=advantages,
+        ref_per_token_logps=None,
+        old_per_token_logps=old_logps,
+    )
+
+    cfg_mask = self._config(
+        clip_mode='mask',
+        loss_algo='grpo',
+        loss_agg_mode='token-mean',
+        epsilon=0.05,
+        epsilon_high=0.06,
+        epsilon_neg=0.06,
+        epsilon_neg_high=0.05,
+    )
+    cfg_ppo = self._config(
+        clip_mode='ppo',
+        loss_algo='grpo',
+        loss_agg_mode='token-mean',
+        epsilon=0.05,
+        epsilon_high=0.06,
+    )
+
+    def _loss_wrt_logps(logps_var, cfg):
+      def _fake_compute_logps(*args, **kwargs):
+        del args, kwargs
+        return logps_var, jnp.zeros_like(logps_var)
+
+      with mock.patch.object(
+          common, 'compute_per_token_logps', side_effect=_fake_compute_logps
+      ):
+        out = algo_core.grpo_loss_fn(self.model, ex, cfg, pad_id=0, eos_id=-1)
+        return out.primary_loss.compute(), out.aux_metrics
+
+    (loss_mask, aux_mask), grad_mask = jax.value_and_grad(
+        _loss_wrt_logps, has_aux=True
+    )(target_logps, cfg_mask)
+    (_, _), grad_ppo = jax.value_and_grad(_loss_wrt_logps, has_aux=True)(
+        target_logps, cfg_ppo
+    )
+
+    # Under PPO, pessimistic bound (row 0, tok 1: adv > 0, ratio=0.85 < 0.95) has non-zero grad
+    self.assertNotEqual(float(grad_ppo[0, 1]), 0.0)
+
+    # Under clip_mode='mask', all 4 out-of-band tokens have exact 0.0 gradient
+    self.assertEqual(float(grad_mask[0, 1]), 0.0)
+    self.assertEqual(float(grad_mask[0, 2]), 0.0)
+    self.assertEqual(float(grad_mask[1, 1]), 0.0)
+    self.assertEqual(float(grad_mask[1, 2]), 0.0)
+
+    # And the 2 in-band tokens have non-zero gradients matching (-adv * ratio) / 6
+    np.testing.assert_allclose(
+        float(grad_mask[0, 0]), (-2.0 * 1.00) / 6.0, rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        float(grad_mask[1, 0]), (1.5 * 0.945) / 6.0, rtol=1e-5
+    )
+
+    # Loss and clipfrac: 4 of 6 tokens masked -> pg_clipfrac == 4/6
+    expected_loss = (-2.0 * 1.00 + 1.5 * 0.945) / 6.0
+    np.testing.assert_allclose(float(loss_mask), expected_loss, rtol=1e-5)
+    np.testing.assert_allclose(
+        float(aux_mask['pg_clipfrac'].compute()), 4.0 / 6.0, rtol=1e-5
+    )
+
+  def test_gspo_turn_level_pooling_and_independent_turn_clipping(self):
+    """Turn-level GSPO pools geometric mean ratio per turn without corrupting row loss reduction."""
+    from unittest import mock  # pylint: disable=g-import-not-at-top
+    from tunix.rl import common  # pylint: disable=g-import-not-at-top
+
+    # 1 trajectory with 2 assistant turns separated by an env observation token:
+    # Turn 1 (tokens 0, 1): log_ratio = +0.002 (exp(0.002) ~ 1.002 > 1.0004 -> clipped!)
+    # Turn 2 (tokens 3, 4): log_ratio = 0.0 (ratio = 1.0 -> unclipped!)
+    # Under sequence-level GSPO, mean log_ratio across all 4 tokens is +0.001 (> 4e-4), so ALL 4 tokens clip (pg_clipfrac=1.0).
+    # Under turn-level GSPO (gspo-turn), Turn 1 clips while Turn 2 stays unclipped (pg_clipfrac=0.5, seq_clipfrac=0.5).
+    old_logps = jnp.full((1, 5), -2.0, dtype=jnp.float32)
+    target_logps = old_logps + jnp.array(
+        [[0.002, 0.002, 0.0, 0.0, 0.0]], dtype=jnp.float32
+    )
+    comp_mask = jnp.array([[1.0, 1.0, 0.0, 1.0, 1.0]], dtype=jnp.float32)
+    turn_ids = jnp.array([[1, 1, 0, 2, 2]], dtype=jnp.int32)
+    ex = common.TrainExample(
+        prompt_ids=jnp.array([[1, 2]], dtype=jnp.int32),
+        prompt_mask=jnp.ones((1, 2), dtype=jnp.int32),
+        completion_ids=jnp.array([[3, 4, 5, 6, 7]], dtype=jnp.int32),
+        completion_mask=comp_mask,
+        advantages=jnp.array([1.0], dtype=jnp.float32),
+        ref_per_token_logps=None,
+        old_per_token_logps=old_logps,
+        turn_ids=turn_ids,
+        num_turn_segments=2,
+    )
+
+    def _run_loss(loss_algo, gspo_pool_mode='sequence'):
+      cfg = self._config(
+          loss_algo=loss_algo,
+          gspo_pool_mode=gspo_pool_mode,
+          epsilon=3e-4,
+          epsilon_high=4e-4,
+      )
+
+      def _fake_compute_logps(*args, **kwargs):
+        del args, kwargs
+        return target_logps, jnp.zeros_like(target_logps)
+
+      with mock.patch.object(
+          common, 'compute_per_token_logps', side_effect=_fake_compute_logps
+      ):
+        return algo_core.grpo_loss_fn(self.model, ex, cfg, pad_id=0, eos_id=-1)
+
+    out_seq = _run_loss('gspo-token', 'sequence')
+    out_turn = _run_loss('gspo-turn', 'turn')
+    np.testing.assert_allclose(
+        float(out_seq.aux_metrics['pg_clipfrac'].compute()), 1.0, rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        float(out_turn.aux_metrics['pg_clipfrac'].compute()), 0.5, rtol=1e-5
+    )
+    np.testing.assert_allclose(
+        float(out_turn.aux_metrics['seq_clipfrac']), 0.5, rtol=1e-5
+    )
+    self.assertIn('log_ratio/mean', out_turn.aux_metrics)
+    self.assertIn('log_ratio_abs_mean', out_turn.aux_metrics)
+
+  def test_grpo_loss_fn_forwards_token_mask_for_step0_ratio_unity(self):
+    """Forwarding TrainExample.token_mask in grpo_loss_fn gives exact 0 log_ratio at step 0."""
+    from flax import nnx  # pylint: disable=g-import-not-at-top
+    from tunix.rl import common  # pylint: disable=g-import-not-at-top
+
+    class _PosSensitiveModel(nnx.Module):
+
+      def __init__(self, vocab: int, rngs: nnx.Rngs):
+        self.emb = nnx.Embed(vocab, 8, rngs=rngs)
+        self.head = nnx.Linear(8, vocab, rngs=rngs)
+
+      def __call__(
+          self,
+          x,
+          segment_ids=None,
+          positions=None,
+          cache=None,
+          attention_mask=None,
+      ):
+        del segment_ids, attention_mask
+        h = self.emb(x) + positions[:, :, None].astype(jnp.float32) * 0.25
+        return self.head(h), cache
+
+    model = _PosSensitiveModel(16, nnx.Rngs(7))
+    prompt_ids = jnp.array([[1, 2]], dtype=jnp.int32)
+    prompt_mask = jnp.array([[1, 1]], dtype=jnp.int32)
+    # Completion contains a real token equal to pad_id=0 at index 0
+    completion_ids = jnp.array([[0, 3, 4, 0]], dtype=jnp.int32)
+    completion_mask = jnp.array([[1.0, 1.0, 1.0, 0.0]], dtype=jnp.float32)
+    token_mask = jnp.array(
+        [[True, True, True, True, True, False]], dtype=jnp.bool_
+    )
+
+    graphdef, state = nnx.split(model)
+    old_logps = common.compute_per_token_logps(
+        graphdef,
+        state,
+        prompt_ids,
+        completion_ids,
+        pad_id=0,
+        eos_id=-1,
+        stop_gradient=True,
+        return_entropy=False,
+        token_mask=token_mask,
+    )
+    ex = common.TrainExample(
+        prompt_ids=prompt_ids,
+        prompt_mask=prompt_mask,
+        completion_ids=completion_ids,
+        completion_mask=completion_mask,
+        advantages=jnp.array([1.0], dtype=jnp.float32),
+        ref_per_token_logps=None,
+        old_per_token_logps=old_logps,
+        token_mask=token_mask,
+    )
+    out = algo_core.grpo_loss_fn(
+        model, ex, self._config(loss_algo='gspo-token'), pad_id=0, eos_id=-1
+    )
+    np.testing.assert_allclose(
+        float(out.aux_metrics['log_ratio_abs_mean']),
+        0.0,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        float(out.aux_metrics['is_ratio/mean']),
+        1.0,
+        atol=1e-6,
+    )
+
+  def test_gspo_turn_jit_closure_captured_train_example(self):
+    """Regression test: closure-captured TrainExample under jax.jit must not raise ConcretizationTypeError."""
+    from unittest import mock  # pylint: disable=g-import-not-at-top
+    from tunix.rl import common  # pylint: disable=g-import-not-at-top
+
+    ex_closed = common.TrainExample(
+        prompt_ids=jnp.ones((4, 2), dtype=jnp.int32),
+        prompt_mask=jnp.ones((4, 2), dtype=jnp.int32),
+        completion_ids=jnp.ones((4, 4), dtype=jnp.int32),
+        completion_mask=jnp.ones((4, 4), dtype=jnp.float32),
+        advantages=jnp.ones((4, 4), dtype=jnp.float32),
+        ref_per_token_logps=None,
+        old_per_token_logps=jnp.full((4, 4), -1.0, dtype=jnp.float32),
+        turn_ids=jnp.array([[1, 1, 2, 2]] * 4, dtype=jnp.int32),
+        num_turn_segments=None,
+    )
+    cfg = self._config(
+        loss_algo='gspo-turn',
+        gspo_pool_mode='turn',
+        epsilon=3e-4,
+        epsilon_high=4e-4,
+    )
+
+    def _closed_jit_fn(logps_in):
+      with mock.patch.object(
+          common,
+          'compute_per_token_logps',
+          return_value=(logps_in, jnp.zeros_like(logps_in)),
+      ):
+        return algo_core.grpo_loss_fn(
+            self.model, ex_closed, cfg, pad_id=0, eos_id=-1
+        ).primary_loss.compute()
+
+    loss_val = jax.jit(_closed_jit_fn)(
+        jnp.full((4, 4), -1.0, dtype=jnp.float32)
+    )
+    self.assertTrue(bool(jnp.isfinite(loss_val)))
+    np.testing.assert_allclose(float(loss_val), -1.0, rtol=1e-5)
+
+  def test_gspo_turn_span_subturn_pooling(self):
+    """Span and sub-turn span pooling ('span' and 'turn_span') separate flagged vs unflagged tokens."""
+    # Single turn (turn_id=1) with 4 tokens:
+    # - Tokens 0, 1 are unflagged (token_flags=0) with log_diff = +0.0001 (in-band for eps=4e-4).
+    # - Tokens 2, 3 are flagged (token_flags=1) with log_diff = +0.0020 (out-of-band).
+    # Whole-turn pooling ('turn') averages all 4 tokens to +0.00105 (> 4e-4), clipping ALL 4 tokens.
+    # Span ('span') and sub-turn span ('turn_span') pool unflagged (+0.0001) and flagged (+0.0020) separately,
+    # keeping tokens 0, 1 unclipped while clipping tokens 2, 3.
+    old_logps = jnp.full((1, 4), -2.0, dtype=jnp.float32)
+    cur_logps = old_logps + jnp.array(
+        [[0.0001, 0.0001, 0.0020, 0.0020]], dtype=jnp.float32
+    )
+    comp_mask = jnp.ones((1, 4), dtype=jnp.float32)
+    turn_ids = jnp.ones((1, 4), dtype=jnp.int32)
+    token_flags = jnp.array([[0, 0, 1, 1]], dtype=jnp.int8)
+
+    ratio_turn, log_r_turn = algo_core.compute_gspo_importance_ratio(
+        cur_logps,
+        old_logps,
+        comp_mask,
+        loss_algo='gspo-turn',
+        gspo_pool_mode='turn',
+        turn_ids=turn_ids,
+        num_turn_segments=2,
+        token_flags=token_flags,
+    )
+    ratio_span, log_r_span = algo_core.compute_gspo_importance_ratio(
+        cur_logps,
+        old_logps,
+        comp_mask,
+        loss_algo='gspo-token',
+        gspo_pool_mode='span',
+        token_flags=token_flags,
+    )
+    ratio_ts, log_r_ts = algo_core.compute_gspo_importance_ratio(
+        cur_logps,
+        old_logps,
+        comp_mask,
+        loss_algo='gspo-turn',
+        gspo_pool_mode='turn_span',
+        turn_ids=turn_ids,
+        num_turn_segments=2,
+        token_flags=token_flags,
+    )
+    np.testing.assert_allclose(
+        np.asarray(log_r_turn),
+        np.full((1, 4), 0.00105, dtype=np.float32),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(log_r_span),
+        np.array([[0.0001, 0.0001, 0.0020, 0.0020]], dtype=np.float32),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(log_r_ts),
+        np.array([[0.0001, 0.0001, 0.0020, 0.0020]], dtype=np.float32),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    self.assertTrue(bool(jnp.all(ratio_turn > 1.0 + 4e-4)))
+    self.assertTrue(bool(jnp.all(ratio_span[:, :2] <= 1.0 + 4e-4)))
+    self.assertTrue(bool(jnp.all(ratio_span[:, 2:] > 1.0 + 4e-4)))
+    self.assertTrue(bool(jnp.all(ratio_ts[:, :2] <= 1.0 + 4e-4)))
+    self.assertTrue(bool(jnp.all(ratio_ts[:, 2:] > 1.0 + 4e-4)))
+
+    # When token_flags is all-zero, 'turn_span' is bitwise identical to 'turn'
+    ratio_zero, log_r_zero = algo_core.compute_gspo_importance_ratio(
+        cur_logps,
+        old_logps,
+        comp_mask,
+        loss_algo='gspo-turn',
+        gspo_pool_mode='turn_span',
+        turn_ids=turn_ids,
+        num_turn_segments=2,
+        token_flags=jnp.zeros_like(token_flags),
+    )
+    np.testing.assert_allclose(
+        np.asarray(log_r_zero), np.asarray(log_r_turn), rtol=1e-6, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        np.asarray(ratio_zero), np.asarray(ratio_turn), rtol=1e-6, atol=1e-6
+    )
+
+  def test_gspo_length_adaptive_clipping_bounds(self):
+    """Length-adaptive clipping scales eps(L) = clip(eps * sqrt(L_ref / L), eps_min, eps_max)."""
+    # Turn 1 has L=4 tokens, Turn 2 has L=16 tokens, with L_ref=16 and base eps=0.004:
+    # - Turn 1 scale = sqrt(16 / 4) = 2.0 -> eff_eps = 0.008
+    # - Turn 2 scale = sqrt(16 / 16) = 1.0 -> eff_eps = 0.004
+    # A ratio of 1.006 is inside [1 - 0.008, 1 + 0.008] for Turn 1 (unclipped),
+    # but outside [1 - 0.004, 1 + 0.004] for Turn 2 (clipped!).
+    adv = jnp.ones((1, 20), dtype=jnp.float32)
+    is_ratio = jnp.full((1, 20), 1.006, dtype=jnp.float32)
+    active_mask = jnp.ones((1, 20), dtype=jnp.bool_)
+    comp_mask = jnp.ones((1, 20), dtype=jnp.float32)
+    turn_ids = jnp.concatenate(
+        [
+            jnp.ones((1, 4), dtype=jnp.int32),
+            jnp.full((1, 16), 2, dtype=jnp.int32),
+        ],
+        axis=1,
+    )
+
+    # Without length-adaptive clipping, all 20 tokens exceed 1 + 0.004 -> clip_frac = 20
+    _, _, _, clip_fixed, _ = algo_core.compute_policy_loss_and_clipping(
+        adv,
+        is_ratio,
+        active_mask,
+        clip_mode='mask',
+        epsilon=0.004,
+        epsilon_high=0.004,
+        completion_mask=comp_mask,
+        gspo_length_adaptive_clipping=False,
+        gspo_ref_length=16,
+        turn_ids=turn_ids,
+        num_turn_segments=3,
+        gspo_pool_mode='turn',
+    )
+    self.assertEqual(float(clip_fixed), 20.0)
+
+    # With length-adaptive clipping, Turn 1 (4 tokens) stays unclipped while Turn 2 (16 tokens) clips -> 16.0
+    loss_adapt, _, _, clip_adapt, _ = (
+        algo_core.compute_policy_loss_and_clipping(
+            adv,
+            is_ratio,
+            active_mask,
+            clip_mode='mask',
+            epsilon=0.004,
+            epsilon_high=0.004,
+            completion_mask=comp_mask,
+            gspo_length_adaptive_clipping=True,
+            gspo_ref_length=16,
+            gspo_clip_min=0.001,
+            gspo_clip_max=0.05,
+            turn_ids=turn_ids,
+            num_turn_segments=3,
+            gspo_pool_mode='turn',
+        )
+    )
+    self.assertEqual(float(clip_adapt), 16.0)
+    self.assertTrue(bool(jnp.all(loss_adapt[:, :4] != 0.0)))
+    self.assertTrue(bool(jnp.all(loss_adapt[:, 4:] == 0.0)))
+
+  def test_clip_mode_mask_supports_gspo_turn_and_token(self):
+    """clip_mode='mask' works with gspo-turn and gspo-token + turn_span, zeroing out-of-band gradients."""
+    from unittest import mock  # pylint: disable=g-import-not-at-top
+    from tunix.rl import common  # pylint: disable=g-import-not-at-top
+
+    # 1 trajectory, 1 turn, 4 tokens:
+    # Unflagged (toks 0, 1): log_diff = +0.0001 (in-band for eps=4e-4) -> non-zero gradient!
+    # Flagged (toks 2, 3): log_diff = +0.0020 (out-of-band for eps=4e-4) -> exact 0.0 gradient!
+    old_logps = jnp.full((1, 4), -2.0, dtype=jnp.float32)
+    target_logps = old_logps + jnp.array(
+        [[0.0001, 0.0001, 0.0020, 0.0020]], dtype=jnp.float32
+    )
+    comp_mask = jnp.ones((1, 4), dtype=jnp.float32)
+    turn_ids = jnp.ones((1, 4), dtype=jnp.int32)
+    token_flags = jnp.array([[0, 0, 1, 1]], dtype=jnp.int8)
+    advantages = jnp.array([[1.5, 1.5, -1.0, -1.0]], dtype=jnp.float32)
+
+    ex = common.TrainExample(
+        prompt_ids=jnp.array([[1, 2]], dtype=jnp.int32),
+        prompt_mask=jnp.ones((1, 2), dtype=jnp.int32),
+        completion_ids=jnp.array([[3, 4, 5, 6]], dtype=jnp.int32),
+        completion_mask=comp_mask,
+        advantages=advantages,
+        ref_per_token_logps=None,
+        old_per_token_logps=old_logps,
+        turn_ids=turn_ids,
+        num_turn_segments=2,
+        token_flags=token_flags,
+    )
+    cfg = self._config(
+        loss_algo='gspo-turn',
+        gspo_pool_mode='turn_span',
+        clip_mode='mask',
+        epsilon=3e-4,
+        epsilon_high=4e-4,
+        epsilon_neg=4e-4,
+        epsilon_neg_high=3e-4,
+    )
+
+    def _loss_wrt_logps(logps_var):
+      with mock.patch.object(
+          common,
+          'compute_per_token_logps',
+          return_value=(logps_var, jnp.zeros_like(logps_var)),
+      ):
+        out = algo_core.grpo_loss_fn(self.model, ex, cfg, pad_id=0, eos_id=-1)
+        return out.primary_loss.compute(), out.aux_metrics
+
+    (loss_val, aux), grad_logps = jax.value_and_grad(
+        _loss_wrt_logps, has_aux=True
+    )(target_logps)
+    self.assertTrue(bool(jnp.isfinite(loss_val)))
+    # In-band unflagged tokens (0, 1) have non-zero gradients
+    self.assertNotEqual(float(grad_logps[0, 0]), 0.0)
+    self.assertNotEqual(float(grad_logps[0, 1]), 0.0)
+    # Out-of-band flagged tokens (2, 3) have exact 0.0 gradients under clip_mode='mask'
+    self.assertEqual(float(grad_logps[0, 2]), 0.0)
+    self.assertEqual(float(grad_logps[0, 3]), 0.0)
+    np.testing.assert_allclose(
+        float(aux['pg_clipfrac'].compute()), 0.5, rtol=1e-5
     )
 
 

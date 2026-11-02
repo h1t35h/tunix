@@ -240,6 +240,116 @@ class AgenticRLLearnerTest(parameterized.TestCase):
         learner.train(train_dataset)
         spy_consumer_gen.assert_called_once_with(mock.ANY, 4)
 
+  def test_train_batch_size_mismatch_raises_when_compute_logps_is_one(self):
+    """compute_logps_micro_batch_size=1 with train_micro_batch_size=2 raises ValueError (no >1 bypass)."""
+    with mock.patch.object(rl_utils, "is_sharing_weights", return_value=False):
+      rl_engine = mock.Mock()
+      rl_engine.cluster_config = mock.Mock()
+      rl_engine.cluster_config.role_to_mesh = {
+          rl_engine_lib.Role.ACTOR: mock.Mock(),
+          rl_engine_lib.Role.ROLLOUT: mock.Mock(),
+      }
+      training_config = mock.Mock()
+      training_config.compute_logps_micro_batch_size = 1
+      training_config.train_micro_batch_size = 2
+      training_config.mini_batch_size = 2
+      training_config.max_seq_token_per_tpu = None
+      rl_engine.cluster_config.training_config = training_config
+      rl_engine.cluster_config.rollout_config = base_rollout.RolloutConfig(
+          max_tokens_to_generate=10, return_logprobs=True
+      )
+      rl_engine.cluster_config.rollout_engine = "generic"
+      rl_engine.actor_trainer = mock.Mock()
+      rl_engine.actor_trainer.restored_global_step.return_value = 0
+      rl_engine.actor_trainer.iter_steps = 0
+      rl_engine.rollout = mock.Mock()
+      rl_engine.tokenizer = mock.Mock()
+      algo_config = agentic_rl_learner.AgenticRLConfig(max_response_length=10)
+      learner = DummyLearner(
+          rl_engine=rl_engine,
+          reward_fns=mock.Mock(),
+          algo_config=algo_config,
+      )
+      with self.assertRaisesRegex(
+          ValueError,
+          r"compute_logps_micro_batch_size \(1\) must be equal to"
+          r" train_micro_batch_size \(2\)",
+      ):
+        learner.train([{"prompt": ["p1", "p2"]}])
+
+  def test_compute_logps_micro_batch_size_defaults_to_train_micro_batch_size(
+      self,
+  ):
+    """compute_logps_micro_batch_size=None defaults to train_micro_batch_size during train() and flattens group_batch."""
+    with mock.patch.object(rl_utils, "is_sharing_weights", return_value=False):
+      rl_engine = mock.MagicMock()
+      rl_engine.cluster_config = mock.Mock()
+      mesh = mock.Mock()
+      mesh.shape = {"fsdp": 1, "dp": 1}
+      rl_engine.cluster_config.role_to_mesh = {
+          rl_engine_lib.Role.ACTOR: mesh,
+          rl_engine_lib.Role.ROLLOUT: mesh,
+      }
+      training_config = mock.Mock()
+      training_config.compute_logps_micro_batch_size = None
+      training_config.train_micro_batch_size = 2
+      training_config.mini_batch_size = 2
+      training_config.get_with_default.return_value = 1
+      training_config.max_seq_token_per_tpu = None
+      training_config.max_steps = 10
+      rl_engine.cluster_config.training_config = training_config
+      rl_engine.cluster_config.rollout_config = base_rollout.RolloutConfig(
+          max_tokens_to_generate=10, return_logprobs=True
+      )
+      rl_engine.cluster_config.rollout_engine = "generic"
+      rl_engine.actor_trainer = mock.Mock()
+      rl_engine.actor_trainer.restored_global_step.return_value = 0
+      rl_engine.actor_trainer.iter_steps = 0
+      rl_engine.global_steps = 0
+      rl_engine.rollout = mock.Mock()
+      rl_engine.tokenizer = mock.Mock()
+      algo_config = agentic_rl_learner.AgenticRLConfig(max_response_length=10)
+      learner = DummyLearner(
+          rl_engine=rl_engine,
+          reward_fns=mock.Mock(),
+          algo_config=algo_config,
+      )
+
+      captured_batches = []
+
+      def fake_b2te(batch_results, mode=None):
+        del mode
+        captured_batches.append(list(batch_results))
+        return [
+            agentic_grpo_learner.TrainExample(
+                prompt_ids=np.ones((4, 2), dtype=np.int32),
+                prompt_mask=np.ones((4, 2), dtype=np.int32),
+                completion_ids=np.ones((4, 2), dtype=np.int32),
+                completion_mask=np.ones((4, 2), dtype=np.int32),
+                advantages=np.ones((4,), dtype=np.float32),
+                ref_per_token_logps=None,
+                old_per_token_logps=None,
+            )
+        ]
+
+      async def mock_producer(*args, **kwargs):
+        del args, kwargs
+        yield ["t1", "t2"]
+        yield ["t3", "t4"]
+
+      with (
+          mock.patch.object(
+              learner, "_orchestrator_producer", side_effect=mock_producer
+          ),
+          mock.patch.object(
+              learner, "_batch_to_train_example", side_effect=fake_b2te
+          ),
+      ):
+        learner.train([{"prompt": ["p1", "p2"]}])
+      self.assertEqual(learner._compute_logps_micro_batch_size, 2)
+      self.assertEqual(learner._train_micro_batch_size, 2)
+      self.assertEqual(captured_batches, [["t1", "t2", "t3", "t4"]])
+
 
 class ExactTokenContinuityConfigTest(absltest.TestCase):
 
@@ -410,6 +520,47 @@ class ExactTokenContinuityConfigTest(absltest.TestCase):
     self.assertTrue(sent["apply_chat_template"])
     self.assertEqual(sent["prompts"], [[{"role": "user", "content": "q"}]])
     self.assertEqual([type(m["content"]) for m in sent["prompts"][0]], [str])
+
+  def test_wrap_group_stream_with_postprocessor(self):
+    from tunix.rl.agentic.agents import agent_types  # pylint: disable=g-import-not-at-top
+
+    class _TagProcessor:
+
+      async def process_group(self, group):
+        for item in group:
+          item.traj["tagged"] = True
+        return group
+
+    async def _raw_stream():
+      yield [agent_types.TrajectoryItem(traj={"id": 1})]
+      yield [agent_types.TrajectoryItem(traj={"id": 2})]
+
+    obj = types.SimpleNamespace(
+        group_postprocessor=_TagProcessor(),
+        group_max_in_flight=4,
+        group_stage_timeout_s=30.0,
+        _group_max_in_flight=4,
+        _group_stage_timeout_s=30.0,
+    )
+    with mock.patch.object(
+        agentic_rl_learner.group_postprocess,
+        "BoundedGroupStage",
+        wraps=agentic_rl_learner.group_postprocess.BoundedGroupStage,
+    ) as spy_stage:
+      wrapped = agentic_rl_learner.AgenticRLLearner._wrap_group_stream(
+          obj, _raw_stream()
+      )
+      spy_stage.assert_called_once_with(
+          obj.group_postprocessor, max_in_flight=4, timeout_s=30.0
+      )
+
+    async def _collect():
+      return [g async for g in wrapped]
+
+    groups = asyncio.run(_collect())
+    self.assertLen(groups, 2)
+    self.assertTrue(groups[0][0].traj["tagged"])
+    self.assertTrue(groups[1][0].traj["tagged"])
 
 
 if __name__ == "__main__":
